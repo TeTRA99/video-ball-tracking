@@ -22,6 +22,7 @@ from typing import Iterator
 import click
 import cv2
 import numpy as np
+import torch
 from tqdm import tqdm
 
 from overlays import OVERLAYS
@@ -69,32 +70,41 @@ def iter_predictions(
     Assumes SAM 3.1's propagate_in_video stream emits one response per frame
     in order — true in the example notebook. If misaligned in practice, we'll
     notice by visible frame skew in the output.
-    """
-    session = predictor.handle_request({
-        "type": "start_session",
-        "resource_path": str(video_path),
-    })
-    session_id = session["session_id"]
 
-    predictor.handle_request({
-        "type": "add_prompt",
-        "session_id": session_id,
-        "frame_index": 0,
-        "text": text_prompt,
-    })
+    The forward pass runs under torch.autocast(bfloat16) because FlashAttention 3
+    on Ada/Ampere GPUs only supports fp16/bf16 inputs. bf16 is preferred over
+    fp16 for numerical stability (wider exponent range, lower overflow risk).
+    """
+    autocast = torch.autocast("cuda", dtype=torch.bfloat16)
+
+    with autocast:
+        session = predictor.handle_request({
+            "type": "start_session",
+            "resource_path": str(video_path),
+        })
+        session_id = session["session_id"]
+
+        predictor.handle_request({
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": 0,
+            "text": text_prompt,
+        })
 
     cap = cv2.VideoCapture(str(video_path))
 
     try:
-        for response in predictor.handle_stream_request({
-            "type": "propagate_in_video",
-            "session_id": session_id,
-        }):
-            ret, frame_bgr = cap.read()
-            if not ret:
-                break
-            mask = _merge_masks(response["outputs"], frame_bgr.shape[:2])
-            yield frame_bgr, mask
+        with autocast:
+            stream = predictor.handle_stream_request({
+                "type": "propagate_in_video",
+                "session_id": session_id,
+            })
+            for response in stream:
+                ret, frame_bgr = cap.read()
+                if not ret:
+                    break
+                mask = _merge_masks(response["outputs"], frame_bgr.shape[:2])
+                yield frame_bgr, mask
     finally:
         cap.release()
         try:
