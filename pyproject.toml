@@ -1,0 +1,18 @@
+[project]
+name = "video-ball-tracking"
+version = "0.1.0"
+description = "Highlight the soccer ball in a match video for visually impaired viewers, using SAM 3.1."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "opencv-python>=4.10",
+    "numpy>=1.26",
+    "click>=8.1",
+    "tqdm>=4.66",
+    "pillow>=10",
+]
+
+# Note: SAM 3.1 itself is installed from the cloned upstream repo
+# (facebookresearch/sam3), not from PyPI. See README.md step 4.
+# PyTorch is installed separately against the latest CUDA wheel index;
+# do not pin it here.

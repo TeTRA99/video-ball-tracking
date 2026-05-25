@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.uv/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Project artifacts
+clips/
+out/
+weights/
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Model checkpoints
+*.pt
+*.pth
+*.safetensors
+
+# HF cache (if accidentally placed locally)
+.cache/
