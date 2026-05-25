@@ -21,6 +21,7 @@ selected key frames later).
 from __future__ import annotations
 
 import time
+from collections import deque
 from pathlib import Path
 from typing import Iterator
 
@@ -49,13 +50,40 @@ def build_predictor(model_size: str = "n"):
     return YOLO(f"yolo26{model_size}-seg.pt")
 
 
-def _merge_masks(result, frame_hw: tuple[int, int]) -> np.ndarray | None:
-    """Union all per-instance masks into one binary mask. None if empty."""
-    if result.masks is None or len(result.masks.data) == 0:
+def _merge_masks(
+    result,
+    frame_hw: tuple[int, int],
+    max_ball_px: int = 80,
+    max_aspect: float = 2.0,
+) -> np.ndarray | None:
+    """Union per-instance masks into one binary mask. Returns None if no
+    detection passes the sanity filters.
+
+    Two filters reject the giant false positives we were seeing:
+    - longest bbox edge must be <= max_ball_px (real ball is ~10-20 px
+      in a broadcast wide shot; even close-ups are <80 px)
+    - bbox aspect ratio must be reasonable (ball is roughly square; a
+      "ball" detection that's 200x50 is clearly wrong)
+    """
+    if result.masks is None or result.boxes is None or len(result.boxes) == 0:
         return None
     H, W = frame_hw
+
+    keep_indices: list[int] = []
+    for i, box in enumerate(result.boxes.xywh):
+        _, _, w, h = box.tolist()
+        if max(w, h) > max_ball_px:
+            continue
+        if min(w, h) > 0 and max(w, h) / min(w, h) > max_aspect:
+            continue
+        keep_indices.append(i)
+
+    if not keep_indices:
+        return None
+
     merged: np.ndarray | None = None
-    for m in result.masks.data:
+    for i in keep_indices:
+        m = result.masks.data[i]
         bm = m.detach().cpu().numpy() if hasattr(m, "detach") else np.asarray(m)
         if bm.shape != (H, W):
             bm = cv2.resize(bm.astype(np.float32), (W, H), interpolation=cv2.INTER_NEAREST)
@@ -69,6 +97,7 @@ def iter_predictions(
     video_path: Path,
     conf: float = 0.25,
     imgsz: int = 640,
+    max_ball_px: int = 80,
 ) -> Iterator[tuple[np.ndarray, np.ndarray | None]]:
     """Yield (frame_bgr, mask_or_None) per frame.
 
@@ -96,7 +125,7 @@ def iter_predictions(
             ret, frame_bgr = cap.read()
             if not ret:
                 break
-            mask = _merge_masks(result, frame_bgr.shape[:2])
+            mask = _merge_masks(result, frame_bgr.shape[:2], max_ball_px=max_ball_px)
             yield frame_bgr, mask
     finally:
         cap.release()
@@ -146,6 +175,22 @@ def iter_predictions(
     help="YOLO long-edge resize. Bump to 1280 or 1920 for broadcast wide shots "
          "where the ball is tiny in the source frame.",
 )
+@click.option(
+    "--max-ball-px",
+    type=int,
+    default=80,
+    show_default=True,
+    help="Reject 'ball' detections larger than this on the longest edge. "
+         "Real soccer ball in a wide shot is ~10-20 px; large detections "
+         "are nearly always false positives (players, goal posts, banners).",
+)
+@click.option(
+    "--trail-frames",
+    type=int,
+    default=30,
+    show_default=True,
+    help="How many recent ball positions to remember for the 'trail' overlay.",
+)
 def main(
     input_path: Path,
     output_path: Path,
@@ -153,6 +198,8 @@ def main(
     model_size: str,
     conf: float,
     imgsz: int,
+    max_ball_px: int,
+    trail_frames: int,
 ) -> None:
     """Annotate a soccer video by overlaying a graphic on the ball."""
     overlay_fn = OVERLAYS[overlay]
@@ -172,19 +219,25 @@ def main(
     predictor = build_predictor(model_size)
     click.echo(
         f"Tracking 'sports ball'  overlay: {overlay}  conf>={conf}  "
-        f"imgsz={imgsz}  frames: {n_frames}"
+        f"imgsz={imgsz}  max_ball_px={max_ball_px}  frames: {n_frames}"
     )
 
+    history: deque[tuple[int, int]] = deque(maxlen=trail_frames)
     t0 = time.perf_counter()
     n_done = 0
     n_hits = 0
-    for frame, mask in tqdm(
-        iter_predictions(predictor, input_path, conf=conf, imgsz=imgsz),
+    for frame_idx, (frame, mask) in enumerate(tqdm(
+        iter_predictions(
+            predictor, input_path,
+            conf=conf, imgsz=imgsz, max_ball_px=max_ball_px,
+        ),
         total=n_frames,
         desc=overlay,
-    ):
+    )):
         if mask is not None and mask.any():
-            frame = overlay_fn(frame, mask)
+            ys, xs = np.where(mask > 0)
+            history.append((int(xs.mean()), int(ys.mean())))
+            frame = overlay_fn(frame, mask, frame_idx=frame_idx, history=history)
             n_hits += 1
         writer.write(frame)
         n_done += 1
