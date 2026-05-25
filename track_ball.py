@@ -68,19 +68,26 @@ def iter_predictions(
     predictor,
     video_path: Path,
     conf: float = 0.25,
+    imgsz: int = 640,
 ) -> Iterator[tuple[np.ndarray, np.ndarray | None]]:
     """Yield (frame_bgr, mask_or_None) per frame.
 
     Ultralytics' stream=True returns one Result per frame, in order.
     OpenCV reads the same video alongside so we get the raw BGR pixels
-    for overlay rendering. conf is lowered from 0.5 default to catch
-    fast/blurry balls in flight.
+    for overlay rendering.
+
+    imgsz is the long-edge size YOLO resizes the input to. The default
+    640 is too aggressive for broadcast wide shots where the ball is
+    ~10-15 px in source — feeding higher imgsz preserves the pixels
+    YOLO needs to recognize the ball. 1280 is a good first bump;
+    1920 keeps 1080p at full detail (but uses ~4x more VRAM than 640).
     """
     results = predictor(
         source=str(video_path),
         stream=True,
         classes=[SPORTS_BALL_CLASS_ID],
         conf=conf,
+        imgsz=imgsz,
         verbose=False,
     )
     cap = cv2.VideoCapture(str(video_path))
@@ -131,12 +138,21 @@ def iter_predictions(
     show_default=True,
     help="Detection confidence threshold (lower catches more, risks false positives).",
 )
+@click.option(
+    "--imgsz",
+    type=int,
+    default=640,
+    show_default=True,
+    help="YOLO long-edge resize. Bump to 1280 or 1920 for broadcast wide shots "
+         "where the ball is tiny in the source frame.",
+)
 def main(
     input_path: Path,
     output_path: Path,
     overlay: str,
     model_size: str,
     conf: float,
+    imgsz: int,
 ) -> None:
     """Annotate a soccer video by overlaying a graphic on the ball."""
     overlay_fn = OVERLAYS[overlay]
@@ -156,14 +172,14 @@ def main(
     predictor = build_predictor(model_size)
     click.echo(
         f"Tracking 'sports ball'  overlay: {overlay}  conf>={conf}  "
-        f"frames: {n_frames}"
+        f"imgsz={imgsz}  frames: {n_frames}"
     )
 
     t0 = time.perf_counter()
     n_done = 0
     n_hits = 0
     for frame, mask in tqdm(
-        iter_predictions(predictor, input_path, conf=conf),
+        iter_predictions(predictor, input_path, conf=conf, imgsz=imgsz),
         total=n_frames,
         desc=overlay,
     ):
