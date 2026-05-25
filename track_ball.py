@@ -34,20 +34,28 @@ from overlays import OVERLAYS
 from tracker import BallTracker
 
 
-# COCO class id 32 = "sports ball". The pretrained YOLO26 model uses
-# the COCO label set; we filter to this class to avoid drawing rings on
-# people, cleats, the ref's whistle, etc.
-SPORTS_BALL_CLASS_ID = 32
+# Default ball class id is 32 (COCO "sports ball" in the stock YOLO26 model).
+# After fine-tuning on football-players-detection, ball is class 0 — pass
+# --ball-class 0 in that case.
+DEFAULT_BALL_CLASS_ID = 32
 
 
-def build_predictor(model_size: str = "n"):
-    """Construct a YOLO26-seg model.
+def build_predictor(model_size: str = "n", weights_path: str | None = None):
+    """Construct a YOLO26 model.
 
-    model_size in {n, s, m, l, x}. n (nano) is plenty for ball detection
-    on a 4070 Laptop and downloads in seconds. Bump up if accuracy on
-    small/distant balls is poor.
+    If weights_path is given, load those custom weights (e.g. fine-tuned
+    `runs/ball_finetune_v1/weights/best.pt`). Otherwise load the stock
+    pretrained yolo26{size}-seg.pt — the -seg variant gives binary masks
+    that feed directly into overlays.
+
+    Fine-tuned weights from the football-players-detection dataset are
+    detection-only (no masks). The iter_predictions code below handles
+    both cases by synthesizing a disk mask from the bbox when masks are
+    absent.
     """
     from ultralytics import YOLO
+    if weights_path:
+        return YOLO(weights_path)
     return YOLO(f"yolo26{model_size}-seg.pt")
 
 
@@ -58,41 +66,50 @@ def _select_best_mask(
     max_aspect: float = 1.5,
 ) -> np.ndarray | None:
     """Pick the SINGLE highest-confidence detection that passes filters and
-    return its mask. Returns None if no detection qualifies.
+    return a binary mask. Works with both segmentation models (uses the
+    real mask) and detection-only models (synthesizes a disk from the
+    bbox).
 
     Picking one (instead of unioning all) eliminates per-frame jumpiness
     when YOLO finds multiple "balls" — typically the real ball plus a few
-    false positives on heads/shadows. Picking the most confident one is
-    a reliable heuristic at this scale.
+    false positives on heads/shadows.
 
     Filters:
-    - longest bbox edge in [4, max_ball_px] (real ball in 1080p is ~15-25
-      px; anything > 35 is almost always a head/shadow/banner)
+    - longest bbox edge in [4, max_ball_px]
     - aspect ratio <= max_aspect (ball is roughly square)
     """
-    if result.masks is None or result.boxes is None or len(result.boxes) == 0:
+    if result.boxes is None or len(result.boxes) == 0:
         return None
     H, W = frame_hw
 
     confs = result.boxes.conf.tolist() if result.boxes.conf is not None else [1.0] * len(result.boxes)
-    candidates: list[tuple[float, int]] = []
+    candidates: list[tuple[float, int, tuple[float, float, float, float]]] = []
     for i, box in enumerate(result.boxes.xywh):
-        _, _, w, h = box.tolist()
+        cx, cy, w, h = box.tolist()
         if not (4 <= max(w, h) <= max_ball_px):
             continue
         if min(w, h) > 0 and max(w, h) / min(w, h) > max_aspect:
             continue
-        candidates.append((confs[i], i))
+        candidates.append((confs[i], i, (cx, cy, w, h)))
 
     if not candidates:
         return None
 
-    _, best_i = max(candidates)
-    m = result.masks.data[best_i]
-    bm = m.detach().cpu().numpy() if hasattr(m, "detach") else np.asarray(m)
-    if bm.shape != (H, W):
-        bm = cv2.resize(bm.astype(np.float32), (W, H), interpolation=cv2.INTER_NEAREST)
-    return (bm > 0.5).astype(np.uint8)
+    _, best_i, (cx, cy, w, h) = max(candidates)
+
+    # Use the real segmentation mask if available
+    if result.masks is not None and best_i < len(result.masks.data):
+        m = result.masks.data[best_i]
+        bm = m.detach().cpu().numpy() if hasattr(m, "detach") else np.asarray(m)
+        if bm.shape != (H, W):
+            bm = cv2.resize(bm.astype(np.float32), (W, H), interpolation=cv2.INTER_NEAREST)
+        return (bm > 0.5).astype(np.uint8)
+
+    # Detection-only model: synthesize a small disk mask from the bbox
+    mask = np.zeros((H, W), dtype=np.uint8)
+    radius = max(2, int(max(w, h) / 2))
+    cv2.circle(mask, (int(cx), int(cy)), radius, 1, -1)
+    return mask
 
 
 def iter_predictions(
@@ -101,23 +118,18 @@ def iter_predictions(
     conf: float = 0.25,
     imgsz: int = 640,
     max_ball_px: int = 35,
+    ball_class: int = DEFAULT_BALL_CLASS_ID,
 ) -> Iterator[tuple[np.ndarray, np.ndarray | None]]:
     """Yield (frame_bgr, mask_or_None) per frame.
 
-    Ultralytics' stream=True returns one Result per frame, in order.
-    OpenCV reads the same video alongside so we get the raw BGR pixels
-    for overlay rendering.
-
-    imgsz is the long-edge size YOLO resizes the input to. The default
-    640 is too aggressive for broadcast wide shots where the ball is
-    ~10-15 px in source — feeding higher imgsz preserves the pixels
-    YOLO needs to recognize the ball. 1280 is a good first bump;
-    1920 keeps 1080p at full detail (but uses ~4x more VRAM than 640).
+    ball_class is the model's class id for "ball": 32 for stock YOLO26
+    (COCO 'sports ball'), 0 for our fine-tuned model on
+    football-players-detection. Set via the --ball-class CLI flag.
     """
     results = predictor(
         source=str(video_path),
         stream=True,
-        classes=[SPORTS_BALL_CLASS_ID],
+        classes=[ball_class],
         conf=conf,
         imgsz=imgsz,
         verbose=False,
@@ -161,7 +173,24 @@ def iter_predictions(
     type=click.Choice(["n", "s", "m", "l", "x"]),
     default="n",
     show_default=True,
-    help="YOLO26-seg model size. n is fastest, x is most accurate.",
+    help="YOLO26-seg model size. n is fastest, x is most accurate. "
+         "Ignored when --model is given.",
+)
+@click.option(
+    "--model",
+    "model_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Path to a custom weights file (e.g. our fine-tuned "
+         "runs/ball_finetune_v1/weights/best.pt). Overrides --model-size.",
+)
+@click.option(
+    "--ball-class",
+    type=int,
+    default=DEFAULT_BALL_CLASS_ID,
+    show_default=True,
+    help="Class id for 'ball' in the model. 32 is COCO 'sports ball' "
+         "(stock model); set to 0 for our fine-tuned model.",
 )
 @click.option(
     "--conf",
@@ -216,6 +245,8 @@ def main(
     output_path: Path,
     overlay: str,
     model_size: str,
+    model_path: Path | None,
+    ball_class: int,
     conf: float,
     imgsz: int,
     max_ball_px: int,
@@ -237,10 +268,16 @@ def main(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
-    click.echo(f"Loading yolo26{model_size}-seg…")
-    predictor = build_predictor(model_size)
+    if model_path:
+        click.echo(f"Loading custom weights: {model_path}")
+    else:
+        click.echo(f"Loading yolo26{model_size}-seg…")
+    predictor = build_predictor(
+        model_size,
+        weights_path=str(model_path) if model_path else None,
+    )
     click.echo(
-        f"Tracking 'sports ball'  overlay: {overlay}  conf>={conf}  "
+        f"Tracking ball (class={ball_class})  overlay: {overlay}  conf>={conf}  "
         f"imgsz={imgsz}  max_ball_px={max_ball_px}  max_jump_px={max_jump_px}  "
         f"max_extrapolate={max_extrapolate}  frames: {n_frames}"
     )
@@ -264,6 +301,7 @@ def main(
         iter_predictions(
             predictor, input_path,
             conf=conf, imgsz=imgsz, max_ball_px=max_ball_px,
+            ball_class=ball_class,
         ),
         total=n_frames,
         desc=overlay,
