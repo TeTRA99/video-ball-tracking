@@ -31,6 +31,7 @@ import numpy as np
 from tqdm import tqdm
 
 from overlays import OVERLAYS
+from tracker import BallTracker
 
 
 # COCO class id 32 = "sports ball". The pretrained YOLO26 model uses
@@ -191,9 +192,17 @@ def iter_predictions(
     type=int,
     default=150,
     show_default=True,
-    help="If the ball appears to move more than this many pixels between "
-         "consecutive hit frames, treat as a false positive and skip drawing. "
-         "Real ball can't teleport across the frame in 1/25 of a second.",
+    help="Per-frame ball motion limit for the tracker. Allowance scales with "
+         "the gap since the last detection.",
+)
+@click.option(
+    "--max-extrapolate",
+    type=int,
+    default=8,
+    show_default=True,
+    help="When YOLO misses the ball, the tracker keeps drawing the overlay "
+         "at the predicted (extrapolated) position for this many frames. "
+         "After that, it gives up until the next real detection.",
 )
 @click.option(
     "--trail-frames",
@@ -211,6 +220,7 @@ def main(
     imgsz: int,
     max_ball_px: int,
     max_jump_px: int,
+    max_extrapolate: int,
     trail_frames: int,
 ) -> None:
     """Annotate a soccer video by overlaying a graphic on the ball."""
@@ -232,16 +242,24 @@ def main(
     click.echo(
         f"Tracking 'sports ball'  overlay: {overlay}  conf>={conf}  "
         f"imgsz={imgsz}  max_ball_px={max_ball_px}  max_jump_px={max_jump_px}  "
-        f"frames: {n_frames}"
+        f"max_extrapolate={max_extrapolate}  frames: {n_frames}"
     )
 
+    tracker = BallTracker(
+        max_jump_per_frame=max_jump_px,
+        max_extrapolate_frames=max_extrapolate,
+    )
     history: deque[tuple[int, int]] = deque(maxlen=trail_frames)
+    # Cache the most recent real mask so we can re-draw it (translated to
+    # the predicted position) during extrapolation frames. Avoids having
+    # to synthesize a disk when we already know the ball's shape.
+    last_real_mask: np.ndarray | None = None
+    last_real_centroid: tuple[int, int] | None = None
+
     t0 = time.perf_counter()
     n_done = 0
-    n_hits = 0
-    n_jumps_rejected = 0
-    prev_centroid: tuple[int, int] | None = None
-    frames_since_hit = 0
+    n_hits = 0       # real detections drawn
+    n_predicted = 0  # extrapolated frames drawn
     for frame_idx, (frame, mask) in enumerate(tqdm(
         iter_predictions(
             predictor, input_path,
@@ -250,46 +268,52 @@ def main(
         total=n_frames,
         desc=overlay,
     )):
+        # Convert detection -> centroid (or None)
         if mask is not None and mask.any():
             ys, xs = np.where(mask > 0)
-            cx, cy = int(xs.mean()), int(ys.mean())
-
-            # Jump filter scales with the gap since the last hit. If YOLO
-            # missed N frames between detections, a real ball could have
-            # moved ~max_jump_px*N pixels legitimately. Without this
-            # scaling, prev_centroid gets stuck at a stale position when
-            # the ball moves across the field while YOLO is silent.
-            if prev_centroid is not None:
-                allowed = max_jump_px * (1 + frames_since_hit)
-                dx = cx - prev_centroid[0]
-                dy = cy - prev_centroid[1]
-                if (dx * dx + dy * dy) > (allowed * allowed):
-                    n_jumps_rejected += 1
-                    # Don't update prev_centroid — wait for a detection
-                    # closer to it. But DO count this as a missed frame so
-                    # the allowance grows.
-                    frames_since_hit += 1
-                    writer.write(frame)
-                    n_done += 1
-                    continue
-
-            history.append((cx, cy))
-            prev_centroid = (cx, cy)
-            frames_since_hit = 0
-            frame = overlay_fn(frame, mask, frame_idx=frame_idx, history=history)
-            n_hits += 1
+            detection = (int(xs.mean()), int(ys.mean()))
         else:
-            frames_since_hit += 1
+            detection = None
+
+        result = tracker.feed(detection)
+        if result is not None:
+            (cx, cy), is_real = result
+            history.append((cx, cy))
+
+            if is_real:
+                draw_mask = mask
+                last_real_mask = mask
+                last_real_centroid = (cx, cy)
+                n_hits += 1
+            else:
+                # Extrapolated frame: shift the last real mask to the
+                # predicted centroid so all overlay shapes work unchanged.
+                if last_real_mask is not None and last_real_centroid is not None:
+                    dx = cx - last_real_centroid[0]
+                    dy = cy - last_real_centroid[1]
+                    M = np.float32([[1, 0, dx], [0, 1, dy]])
+                    draw_mask = cv2.warpAffine(
+                        last_real_mask, M, (last_real_mask.shape[1], last_real_mask.shape[0]),
+                        flags=cv2.INTER_NEAREST, borderValue=0,
+                    )
+                else:
+                    draw_mask = None
+                n_predicted += 1
+
+            if draw_mask is not None:
+                frame = overlay_fn(frame, draw_mask, frame_idx=frame_idx, history=history)
+
         writer.write(frame)
         n_done += 1
 
     writer.release()
     elapsed = time.perf_counter() - t0
     fps_actual = n_done / elapsed if elapsed > 0 else 0.0
+    total_drawn = n_hits + n_predicted
     click.echo(
         f"Wrote {output_path}\n"
-        f"  frames={n_done} hits={n_hits} ({100*n_hits/max(n_done,1):.1f}%) "
-        f"jumps_rejected={n_jumps_rejected} "
+        f"  frames={n_done} hits={n_hits} predicted={n_predicted} "
+        f"drawn={total_drawn} ({100*total_drawn/max(n_done,1):.1f}%) "
         f"elapsed={elapsed:.1f}s avg_fps={fps_actual:.2f}"
     )
 
