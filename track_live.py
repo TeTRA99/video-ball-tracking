@@ -79,7 +79,7 @@ from track_ball import _select_best_mask, build_predictor, DEFAULT_BALL_CLASS_ID
     show_default=True,
     help="Lower = faster live throughput. 640 is a good 4070 default.",
 )
-@click.option("--max-ball-px", type=int, default=35, show_default=True)
+@click.option("--max-ball-px", type=int, default=40, show_default=True)
 @click.option("--max-jump-px", type=int, default=150, show_default=True)
 @click.option(
     "--max-extrapolate",
@@ -196,7 +196,11 @@ def main(
                 verbose=False,
             )
             result = results[0]
-            mask = _select_best_mask(result, frame.shape[:2], max_ball_px=max_ball_px)
+            mask = _select_best_mask(
+                result, frame.shape[:2],
+                max_ball_px=max_ball_px,
+                prev_centroid=tracker.last_centroid,
+            )
 
             if mask is not None and mask.any():
                 ys, xs = np.where(mask > 0)

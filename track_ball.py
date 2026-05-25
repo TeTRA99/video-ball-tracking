@@ -64,6 +64,8 @@ def _select_best_mask(
     frame_hw: tuple[int, int],
     max_ball_px: int = 35,
     max_aspect: float = 1.5,
+    prev_centroid: tuple[int, int] | None = None,
+    proximity_px: int = 200,
 ) -> np.ndarray | None:
     """Pick the SINGLE highest-confidence detection that passes filters and
     return a binary mask. Works with both segmentation models (uses the
@@ -77,6 +79,14 @@ def _select_best_mask(
     Filters:
     - longest bbox edge in [4, max_ball_px]
     - aspect ratio <= max_aspect (ball is roughly square)
+
+    If `prev_centroid` is given and multiple candidates pass the size and
+    aspect filters, we prefer the ones within `proximity_px` of the
+    previous ball position. This kills the common failure mode where a
+    false detection on a player's head has higher confidence than the
+    real ball — the head is rarely near where the ball just was.
+    Falls back to plain max-confidence when no candidates are nearby
+    (genuine ball motion bigger than `proximity_px` from frame to frame).
     """
     if result.boxes is None or len(result.boxes) == 0:
         return None
@@ -94,6 +104,15 @@ def _select_best_mask(
 
     if not candidates:
         return None
+
+    if prev_centroid is not None and len(candidates) > 1:
+        px, py = prev_centroid
+        nearby = [
+            c for c in candidates
+            if (c[2][0] - px) ** 2 + (c[2][1] - py) ** 2 <= proximity_px ** 2
+        ]
+        if nearby:
+            candidates = nearby
 
     _, best_i, (cx, cy, w, h) = max(candidates)
 
@@ -117,10 +136,11 @@ def iter_predictions(
     video_path: Path,
     conf: float = 0.25,
     imgsz: int = 640,
-    max_ball_px: int = 35,
     ball_class: int = DEFAULT_BALL_CLASS_ID,
-) -> Iterator[tuple[np.ndarray, np.ndarray | None]]:
-    """Yield (frame_bgr, mask_or_None) per frame.
+) -> Iterator[tuple[np.ndarray, object]]:
+    """Yield (frame_bgr, raw_result) per frame. The caller is responsible
+    for picking the best mask from the raw result — this lets the main
+    loop pass tracker state (previous centroid) into the selection.
 
     ball_class is the model's class id for "ball": 32 for stock YOLO26
     (COCO 'sports ball'), 0 for our fine-tuned model on
@@ -140,8 +160,7 @@ def iter_predictions(
             ret, frame_bgr = cap.read()
             if not ret:
                 break
-            mask = _select_best_mask(result, frame_bgr.shape[:2], max_ball_px=max_ball_px)
-            yield frame_bgr, mask
+            yield frame_bgr, result
     finally:
         cap.release()
 
@@ -210,11 +229,12 @@ def iter_predictions(
 @click.option(
     "--max-ball-px",
     type=int,
-    default=35,
+    default=40,
     show_default=True,
     help="Reject 'ball' detections larger than this on the longest edge. "
-         "Real soccer ball in 1080p wide shot is ~15-25 px; over 35 is "
-         "almost always a head/shadow/banner false positive.",
+         "Real soccer ball in 1080p wide shot is ~15-25 px; over ~40 is "
+         "almost always a head/shadow/banner false positive. Bump to 60+ "
+         "for close-up footage where the ball is genuinely larger.",
 )
 @click.option(
     "--max-jump-px",
@@ -300,25 +320,34 @@ def main(
     n_done = 0
     n_hits = 0       # real detections drawn
     n_predicted = 0  # extrapolated frames drawn
-    for frame_idx, (frame, mask) in enumerate(tqdm(
+    for frame_idx, (frame, raw_result) in enumerate(tqdm(
         iter_predictions(
             predictor, input_path,
-            conf=conf, imgsz=imgsz, max_ball_px=max_ball_px,
+            conf=conf, imgsz=imgsz,
             ball_class=ball_class,
         ),
         total=n_frames,
         desc=overlay,
     )):
-        # Convert detection -> centroid (or None)
+        # Mask selection happens here (not inside iter_predictions) so we
+        # can pass the tracker's last known centroid in — that lets the
+        # selector prefer detections near where the ball just was instead
+        # of always picking max confidence.
+        mask = _select_best_mask(
+            raw_result, frame.shape[:2],
+            max_ball_px=max_ball_px,
+            prev_centroid=tracker.last_centroid,
+        )
+
         if mask is not None and mask.any():
             ys, xs = np.where(mask > 0)
             detection = (int(xs.mean()), int(ys.mean()))
         else:
             detection = None
 
-        result = tracker.feed(detection)
-        if result is not None:
-            (cx, cy), is_real = result
+        tracked = tracker.feed(detection)
+        if tracked is not None:
+            (cx, cy), is_real = tracked
             history.append((cx, cy))
 
             if is_real:
