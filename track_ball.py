@@ -28,10 +28,23 @@ from tqdm import tqdm
 from overlays import OVERLAYS
 
 
-def build_predictor():
-    """Construct the SAM 3.1 multi-object (Object Multiplex) video predictor."""
+def build_predictor(max_num_objects: int = 2):
+    """Construct the SAM 3.1 multi-object (Object Multiplex) video predictor.
+
+    max_num_objects sizes the multiplex bucket. The default in upstream is 16,
+    which preallocates VRAM for 16 objects whether they exist or not — too
+    heavy for 8 GB consumer GPUs when we only need 1 ball. Drop to 2 (one
+    real + headroom for false positives).
+    """
     from sam3.model_builder import build_sam3_multiplex_video_predictor
-    return build_sam3_multiplex_video_predictor()
+    try:
+        return build_sam3_multiplex_video_predictor(max_num_objects=max_num_objects)
+    except TypeError:
+        # Older API didn't expose max_num_objects on the builder; fall back.
+        predictor = build_sam3_multiplex_video_predictor()
+        if hasattr(predictor, "model") and hasattr(predictor.model, "max_num_objects"):
+            predictor.model.max_num_objects = max_num_objects
+        return predictor
 
 
 def _to_numpy_mask(m, target_hw: tuple[int, int]) -> np.ndarray:
