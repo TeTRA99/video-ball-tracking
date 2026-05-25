@@ -50,46 +50,48 @@ def build_predictor(model_size: str = "n"):
     return YOLO(f"yolo26{model_size}-seg.pt")
 
 
-def _merge_masks(
+def _select_best_mask(
     result,
     frame_hw: tuple[int, int],
-    max_ball_px: int = 80,
-    max_aspect: float = 2.0,
+    max_ball_px: int = 35,
+    max_aspect: float = 1.5,
 ) -> np.ndarray | None:
-    """Union per-instance masks into one binary mask. Returns None if no
-    detection passes the sanity filters.
+    """Pick the SINGLE highest-confidence detection that passes filters and
+    return its mask. Returns None if no detection qualifies.
 
-    Two filters reject the giant false positives we were seeing:
-    - longest bbox edge must be <= max_ball_px (real ball is ~10-20 px
-      in a broadcast wide shot; even close-ups are <80 px)
-    - bbox aspect ratio must be reasonable (ball is roughly square; a
-      "ball" detection that's 200x50 is clearly wrong)
+    Picking one (instead of unioning all) eliminates per-frame jumpiness
+    when YOLO finds multiple "balls" — typically the real ball plus a few
+    false positives on heads/shadows. Picking the most confident one is
+    a reliable heuristic at this scale.
+
+    Filters:
+    - longest bbox edge in [4, max_ball_px] (real ball in 1080p is ~15-25
+      px; anything > 35 is almost always a head/shadow/banner)
+    - aspect ratio <= max_aspect (ball is roughly square)
     """
     if result.masks is None or result.boxes is None or len(result.boxes) == 0:
         return None
     H, W = frame_hw
 
-    keep_indices: list[int] = []
+    confs = result.boxes.conf.tolist() if result.boxes.conf is not None else [1.0] * len(result.boxes)
+    candidates: list[tuple[float, int]] = []
     for i, box in enumerate(result.boxes.xywh):
         _, _, w, h = box.tolist()
-        if max(w, h) > max_ball_px:
+        if not (4 <= max(w, h) <= max_ball_px):
             continue
         if min(w, h) > 0 and max(w, h) / min(w, h) > max_aspect:
             continue
-        keep_indices.append(i)
+        candidates.append((confs[i], i))
 
-    if not keep_indices:
+    if not candidates:
         return None
 
-    merged: np.ndarray | None = None
-    for i in keep_indices:
-        m = result.masks.data[i]
-        bm = m.detach().cpu().numpy() if hasattr(m, "detach") else np.asarray(m)
-        if bm.shape != (H, W):
-            bm = cv2.resize(bm.astype(np.float32), (W, H), interpolation=cv2.INTER_NEAREST)
-        bm = (bm > 0.5).astype(np.uint8)
-        merged = bm if merged is None else np.logical_or(merged, bm).astype(np.uint8)
-    return merged
+    _, best_i = max(candidates)
+    m = result.masks.data[best_i]
+    bm = m.detach().cpu().numpy() if hasattr(m, "detach") else np.asarray(m)
+    if bm.shape != (H, W):
+        bm = cv2.resize(bm.astype(np.float32), (W, H), interpolation=cv2.INTER_NEAREST)
+    return (bm > 0.5).astype(np.uint8)
 
 
 def iter_predictions(
@@ -97,7 +99,7 @@ def iter_predictions(
     video_path: Path,
     conf: float = 0.25,
     imgsz: int = 640,
-    max_ball_px: int = 80,
+    max_ball_px: int = 35,
 ) -> Iterator[tuple[np.ndarray, np.ndarray | None]]:
     """Yield (frame_bgr, mask_or_None) per frame.
 
@@ -125,7 +127,7 @@ def iter_predictions(
             ret, frame_bgr = cap.read()
             if not ret:
                 break
-            mask = _merge_masks(result, frame_bgr.shape[:2], max_ball_px=max_ball_px)
+            mask = _select_best_mask(result, frame_bgr.shape[:2], max_ball_px=max_ball_px)
             yield frame_bgr, mask
     finally:
         cap.release()
@@ -178,11 +180,20 @@ def iter_predictions(
 @click.option(
     "--max-ball-px",
     type=int,
-    default=80,
+    default=35,
     show_default=True,
     help="Reject 'ball' detections larger than this on the longest edge. "
-         "Real soccer ball in a wide shot is ~10-20 px; large detections "
-         "are nearly always false positives (players, goal posts, banners).",
+         "Real soccer ball in 1080p wide shot is ~15-25 px; over 35 is "
+         "almost always a head/shadow/banner false positive.",
+)
+@click.option(
+    "--max-jump-px",
+    type=int,
+    default=150,
+    show_default=True,
+    help="If the ball appears to move more than this many pixels between "
+         "consecutive hit frames, treat as a false positive and skip drawing. "
+         "Real ball can't teleport across the frame in 1/25 of a second.",
 )
 @click.option(
     "--trail-frames",
@@ -199,6 +210,7 @@ def main(
     conf: float,
     imgsz: int,
     max_ball_px: int,
+    max_jump_px: int,
     trail_frames: int,
 ) -> None:
     """Annotate a soccer video by overlaying a graphic on the ball."""
@@ -219,13 +231,16 @@ def main(
     predictor = build_predictor(model_size)
     click.echo(
         f"Tracking 'sports ball'  overlay: {overlay}  conf>={conf}  "
-        f"imgsz={imgsz}  max_ball_px={max_ball_px}  frames: {n_frames}"
+        f"imgsz={imgsz}  max_ball_px={max_ball_px}  max_jump_px={max_jump_px}  "
+        f"frames: {n_frames}"
     )
 
     history: deque[tuple[int, int]] = deque(maxlen=trail_frames)
     t0 = time.perf_counter()
     n_done = 0
     n_hits = 0
+    n_jumps_rejected = 0
+    prev_centroid: tuple[int, int] | None = None
     for frame_idx, (frame, mask) in enumerate(tqdm(
         iter_predictions(
             predictor, input_path,
@@ -236,7 +251,23 @@ def main(
     )):
         if mask is not None and mask.any():
             ys, xs = np.where(mask > 0)
-            history.append((int(xs.mean()), int(ys.mean())))
+            cx, cy = int(xs.mean()), int(ys.mean())
+
+            # Jump filter: if ball "moved" too far since last hit, treat as
+            # a false positive in this frame and skip the overlay. Doesn't
+            # break the chain — next frame whose detection is near prev_centroid
+            # still works.
+            if prev_centroid is not None:
+                dx = cx - prev_centroid[0]
+                dy = cy - prev_centroid[1]
+                if (dx * dx + dy * dy) > (max_jump_px * max_jump_px):
+                    n_jumps_rejected += 1
+                    writer.write(frame)
+                    n_done += 1
+                    continue
+
+            history.append((cx, cy))
+            prev_centroid = (cx, cy)
             frame = overlay_fn(frame, mask, frame_idx=frame_idx, history=history)
             n_hits += 1
         writer.write(frame)
@@ -248,6 +279,7 @@ def main(
     click.echo(
         f"Wrote {output_path}\n"
         f"  frames={n_done} hits={n_hits} ({100*n_hits/max(n_done,1):.1f}%) "
+        f"jumps_rejected={n_jumps_rejected} "
         f"elapsed={elapsed:.1f}s avg_fps={fps_actual:.2f}"
     )
 

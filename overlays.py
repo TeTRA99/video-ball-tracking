@@ -46,9 +46,9 @@ def ring(
     frame: np.ndarray,
     mask: np.ndarray,
     color: tuple[int, int, int] = (0, 255, 255),
-    thickness: int = 4,
-    padding: int = 8,
-    max_radius: int = 60,
+    thickness: int = 3,
+    padding: int = 4,
+    max_radius: int = 30,
     **_,
 ) -> np.ndarray:
     """Bright yellow ring around the ball, with a hard radius cap."""
@@ -69,7 +69,7 @@ def halo(
     color: tuple[int, int, int] = (0, 255, 255),
     blur: int = 31,
     alpha: float = 0.8,
-    max_radius: int = 50,
+    max_radius: int = 28,
     **_,
 ) -> np.ndarray:
     """Soft glowing halo around the ball (alpha-blended Gaussian)."""
@@ -133,7 +133,7 @@ def pulse(
     mask: np.ndarray,
     color: tuple[int, int, int] = (0, 255, 255),
     period: int = 16,
-    max_radius: int = 80,
+    max_radius: int = 45,
     frame_idx: int = 0,
     **_,
 ) -> np.ndarray:
