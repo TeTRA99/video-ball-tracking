@@ -251,10 +251,10 @@ OVERLAYS = {
     "arrow": arrow,
     "recolor": recolor,
     "pulse": pulse,
-    "spotlight": spotlight,
     "chevron": chevron,
-    # 'trail' is implemented above but not exposed — too jittery when
-    # YOLO false-positives pollute the position history. Re-enable by
-    # adding "trail": trail here if/when detection is more stable
-    # (e.g. after fine-tuning).
+    # Implemented above but not exposed via CLI — useful again later:
+    # - 'trail': jittery when YOLO false-positives pollute history; revisit
+    #   after fine-tuning makes detection more stable.
+    # - 'spotlight': dims the whole frame too aggressively; only useful in
+    #   curated close-ups, not broadcast wide shots.
 }
