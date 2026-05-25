@@ -81,6 +81,9 @@ def iter_predictions(
         session = predictor.handle_request({
             "type": "start_session",
             "resource_path": str(video_path),
+            # Keep decoded frames on CPU; only stream the current frame to GPU.
+            # Critical for 8 GB consumer GPUs at 720p+.
+            "offload_video_to_cpu": True,
         })
         session_id = session["session_id"]
 
