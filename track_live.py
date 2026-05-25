@@ -30,6 +30,7 @@ from pathlib import Path
 import click
 import cv2
 import numpy as np
+from tqdm import tqdm
 
 from overlays import OVERLAYS
 from tracker import BallTracker
@@ -145,6 +146,9 @@ def main(
         raise click.ClickException("Failed to read first frame from source.")
     H, W = frame.shape[:2]
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    # 0 / -1 for live sources (webcam, RTSP). tqdm shows just the count
+    # in that case, which is fine.
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
 
     writer = None
     if record_path:
@@ -172,6 +176,7 @@ def main(
     rolling_fps = 0.0
     t_last = t_start
     first_iter = True
+    pbar = tqdm(total=total_frames, desc="live", unit="f")
 
     try:
         while True:
@@ -248,11 +253,16 @@ def main(
                     break
 
             n_frames += 1
+            pbar.update(1)
+            if n_frames % 10 == 0:
+                pbar.set_postfix(fps=f"{rolling_fps:.1f}")
     finally:
+        pbar.close()
         cap.release()
         if writer is not None:
             writer.release()
-        cv2.destroyAllWindows()
+        if window:
+            cv2.destroyAllWindows()
 
     elapsed = time.perf_counter() - t_start
     avg_fps = n_frames / elapsed if elapsed > 0 else 0.0
