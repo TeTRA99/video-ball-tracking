@@ -252,6 +252,9 @@ OVERLAYS = {
     "recolor": recolor,
     "pulse": pulse,
     "spotlight": spotlight,
-    "trail": trail,
     "chevron": chevron,
+    # 'trail' is implemented above but not exposed — too jittery when
+    # YOLO false-positives pollute the position history. Re-enable by
+    # adding "trail": trail here if/when detection is more stable
+    # (e.g. after fine-tuning).
 }
