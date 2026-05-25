@@ -227,14 +227,14 @@ def iter_predictions(
 @click.option(
     "--max-extrapolate",
     type=int,
-    default=0,
+    default=3,
     show_default=True,
     help="When YOLO misses the ball, draw the overlay at the predicted "
-         "(extrapolated) position for this many frames. Default 0 means "
-         "don't extrapolate at all — real soccer has too many direction "
-         "changes for constant-velocity prediction, and the drift is "
-         "more distracting than the gap. Set to 4-8 if you want gap-fill "
-         "behavior back for slow/predictable footage.",
+         "(extrapolated) position for this many frames. Constant-velocity "
+         "prediction drifts noticeably past ~3 frames in real soccer "
+         "(direction changes accumulate), but 1-3 frames is invisible "
+         "smoothing that bridges brief detection misses. Set to 0 to "
+         "disable entirely; raise to 6-8 for slow/predictable footage.",
 )
 @click.option(
     "--trail-frames",

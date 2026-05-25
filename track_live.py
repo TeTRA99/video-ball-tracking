@@ -84,10 +84,11 @@ from track_ball import _select_best_mask, build_predictor, DEFAULT_BALL_CLASS_ID
 @click.option(
     "--max-extrapolate",
     type=int,
-    default=0,
+    default=3,
     show_default=True,
-    help="Default 0 = no extrapolation. Real soccer has too many direction "
-         "changes for constant-velocity prediction to look right.",
+    help="Bridge brief detection misses with constant-velocity prediction. "
+         "1-3 frames is invisible smoothing; past ~3 the drift becomes "
+         "noticeable in real soccer. Set 0 to disable.",
 )
 @click.option("--trail-frames", type=int, default=30, show_default=True)
 @click.option(
