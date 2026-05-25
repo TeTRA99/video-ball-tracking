@@ -66,16 +66,23 @@ def main() -> None:
     model.train(
         data=str(data_yaml),
         epochs=100,
-        imgsz=1280,            # high res — matches inference, ball is small
-        batch=-1,              # auto: ultralytics picks based on VRAM
+        # imgsz=960 (not 1280) and batch=4 (not auto) because the 4070 Laptop's
+        # 8 GB VRAM can't hold the autobatch defaults at 1280. Inference can
+        # still use imgsz=1280 — Ultralytics rescales at test time. We also
+        # enable multi-scale so the model sees a range of input sizes during
+        # training, which helps it generalize from 960-train to 1280-inference.
+        imgsz=960,
+        batch=4,
+        multi_scale=True,
         device=0,              # GPU 0
         patience=20,           # early-stop if val mAP plateaus 20 epochs
         cache=True,            # cache images in RAM (we have 16 GB system RAM)
+        amp=True,              # mixed precision — halves activation memory
         project="runs",
         name="ball_finetune_v1",
-        # Sensible class-imbalance handling: ball is 1/4 of detections per
-        # frame at best, so we let the model see all classes during training
-        # but the inference pipeline filters to ball-only via --ball-class.
+        # ball is 1/4 of classes; the inference pipeline filters to ball-only
+        # via --ball-class. Training on all classes is fine and actually helps
+        # the model learn "what is NOT a ball" (players, refs, goalkeepers).
     )
 
     # Quick post-training validation summary on the held-out test split.
