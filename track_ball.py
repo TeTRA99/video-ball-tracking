@@ -241,6 +241,7 @@ def main(
     n_hits = 0
     n_jumps_rejected = 0
     prev_centroid: tuple[int, int] | None = None
+    frames_since_hit = 0
     for frame_idx, (frame, mask) in enumerate(tqdm(
         iter_predictions(
             predictor, input_path,
@@ -253,23 +254,32 @@ def main(
             ys, xs = np.where(mask > 0)
             cx, cy = int(xs.mean()), int(ys.mean())
 
-            # Jump filter: if ball "moved" too far since last hit, treat as
-            # a false positive in this frame and skip the overlay. Doesn't
-            # break the chain — next frame whose detection is near prev_centroid
-            # still works.
+            # Jump filter scales with the gap since the last hit. If YOLO
+            # missed N frames between detections, a real ball could have
+            # moved ~max_jump_px*N pixels legitimately. Without this
+            # scaling, prev_centroid gets stuck at a stale position when
+            # the ball moves across the field while YOLO is silent.
             if prev_centroid is not None:
+                allowed = max_jump_px * (1 + frames_since_hit)
                 dx = cx - prev_centroid[0]
                 dy = cy - prev_centroid[1]
-                if (dx * dx + dy * dy) > (max_jump_px * max_jump_px):
+                if (dx * dx + dy * dy) > (allowed * allowed):
                     n_jumps_rejected += 1
+                    # Don't update prev_centroid — wait for a detection
+                    # closer to it. But DO count this as a missed frame so
+                    # the allowance grows.
+                    frames_since_hit += 1
                     writer.write(frame)
                     n_done += 1
                     continue
 
             history.append((cx, cy))
             prev_centroid = (cx, cy)
+            frames_since_hit = 0
             frame = overlay_fn(frame, mask, frame_idx=frame_idx, history=history)
             n_hits += 1
+        else:
+            frames_since_hit += 1
         writer.write(frame)
         n_done += 1
 
