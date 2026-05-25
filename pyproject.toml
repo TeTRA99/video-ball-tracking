@@ -12,6 +12,9 @@ dependencies = [
     "pillow>=10",
 ]
 
+[tool.setuptools]
+py-modules = ["track_ball", "overlays"]
+
 # Note: SAM 3.1 itself is installed from the cloned upstream repo
 # (facebookresearch/sam3), not from PyPI. See README.md step 4.
 # PyTorch is installed separately against the latest CUDA wheel index;
