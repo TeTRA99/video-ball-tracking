@@ -66,14 +66,14 @@ def main() -> None:
     model.train(
         data=str(data_yaml),
         epochs=100,
-        # imgsz=960 (not 1280) and batch=4 (not auto) because the 4070 Laptop's
-        # 8 GB VRAM can't hold the autobatch defaults at 1280. Inference can
-        # still use imgsz=1280 — Ultralytics rescales at test time. We also
-        # enable multi-scale so the model sees a range of input sizes during
-        # training, which helps it generalize from 960-train to 1280-inference.
-        imgsz=960,
+        # imgsz=640 is what Roboflow's yolo11 preset originally resized
+        # source images to, so we're not throwing away information. batch=4
+        # comfortably fits the 4070 Laptop's 8 GB VRAM at this resolution.
+        # multi_scale stays OFF — at 1.5x scale it tries imgsz=1696 which
+        # OOMs. Inference can still use imgsz=1280 because Ultralytics
+        # supports dynamic input sizes at test time.
+        imgsz=640,
         batch=4,
-        multi_scale=True,
         device=0,              # GPU 0
         patience=20,           # early-stop if val mAP plateaus 20 epochs
         cache=True,            # cache images in RAM (we have 16 GB system RAM)
