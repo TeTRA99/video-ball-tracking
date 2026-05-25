@@ -66,23 +66,18 @@ def main() -> None:
     model.train(
         data=str(data_yaml),
         epochs=100,
-        # imgsz=640 is what Roboflow's yolo11 preset originally resized
-        # source images to, so we're not throwing away information. batch=4
-        # comfortably fits the 4070 Laptop's 8 GB VRAM at this resolution.
-        # multi_scale stays OFF — at 1.5x scale it tries imgsz=1696 which
-        # OOMs. Inference can still use imgsz=1280 because Ultralytics
-        # supports dynamic input sizes at test time.
-        imgsz=640,
-        batch=4,
-        device=0,              # GPU 0
-        patience=20,           # early-stop if val mAP plateaus 20 epochs
-        cache=True,            # cache images in RAM (we have 16 GB system RAM)
-        amp=True,              # mixed precision — halves activation memory
+        # Second attempt: match inference resolution exactly. The first run
+        # at imgsz=640 underperformed at our imgsz=1280 inference because
+        # the model learned ball features at the wrong scale. Training at
+        # 1280 here, with batch=2 to fit 8 GB VRAM.
+        imgsz=1280,
+        batch=2,
+        device=0,
+        patience=20,
+        cache=True,
+        amp=True,
         project="runs",
-        name="ball_finetune_v1",
-        # ball is 1/4 of classes; the inference pipeline filters to ball-only
-        # via --ball-class. Training on all classes is fine and actually helps
-        # the model learn "what is NOT a ball" (players, refs, goalkeepers).
+        name="ball_finetune_v2_1280",
     )
 
     # Quick post-training validation summary on the held-out test split.
