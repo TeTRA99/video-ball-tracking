@@ -254,7 +254,12 @@ def main(
         if ext == ".avi":
             codec_chain = [("MJPG", "MJPG"), ("XVID", "XVID")]
         else:
-            codec_chain = [("avc1", "H.264"), ("mp4v", "MPEG-4"), ("MJPG", "MJPG")]
+            # Skip avc1/H.264 even though it'd produce smaller files —
+            # Windows cv2.VideoWriter returns isOpened()=True even when
+            # OpenH264 is missing and ffmpeg's encoder init silently
+            # fails, so we'd "succeed" into a non-writing writer.
+            # mp4v is Windows-native and works without extra libraries.
+            codec_chain = [("mp4v", "MPEG-4"), ("MJPG", "MJPG")]
         for fourcc_str, label in codec_chain:
             fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
             candidate = cv2.VideoWriter(str(record_path), fourcc, target_fps, (W, H))
