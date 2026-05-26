@@ -239,9 +239,29 @@ def main(
     writer = None
     if record_path:
         record_path.parent.mkdir(parents=True, exist_ok=True)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(record_path), fourcc, src_fps, (W, H))
-        click.echo(f"Recording to: {record_path}")
+        # Codec selection: cv2.VideoWriter on Windows silently produces a
+        # 0-byte file when the requested fourcc isn't available. Pick by
+        # extension and try a small chain; MJPG/.avi is the always-works
+        # fallback (bigger files, but reliable).
+        ext = record_path.suffix.lower()
+        if ext == ".avi":
+            codec_chain = [("MJPG", "MJPG"), ("XVID", "XVID")]
+        else:
+            codec_chain = [("avc1", "H.264"), ("mp4v", "MPEG-4"), ("MJPG", "MJPG")]
+        writer = None
+        for fourcc_str, label in codec_chain:
+            fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+            candidate = cv2.VideoWriter(str(record_path), fourcc, src_fps, (W, H))
+            if candidate.isOpened():
+                writer = candidate
+                click.echo(f"Recording to: {record_path} ({label}/{fourcc_str})")
+                break
+            candidate.release()
+        if writer is None:
+            raise click.ClickException(
+                f"No working codec found for {record_path}. "
+                f"Try a .avi extension or install K-Lite Codec Pack."
+            )
 
     tracker = BallTracker(
         max_jump_per_frame=max_jump_px,
