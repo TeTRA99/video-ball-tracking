@@ -37,12 +37,95 @@ from tracker import BallTracker
 from track_ball import _select_best_mask, build_predictor, DEFAULT_BALL_CLASS_ID
 
 
+class _FrameSource:
+    """Unified BGR frame producer for the live loop.
+
+    Wraps either cv2.VideoCapture (file path, webcam index, RTSP/HTTP URL)
+    or mss screen capture behind a single .read() / .release() interface.
+    Hides the awkwardness of bootstrapping the first frame to learn HxW
+    before the main loop starts.
+    """
+
+    def __init__(
+        self,
+        cv_source: int | str | None = None,
+        screen_region: tuple[int, int, int, int] | None = None,
+    ):
+        self.kind = "screen" if cv_source is None else "cv"
+        self.total: int | None = None
+
+        if self.kind == "screen":
+            import mss
+
+            self._sct = mss.mss()
+            # monitors[0] is the union of all screens; [1] is the primary.
+            primary = self._sct.monitors[1]
+            if screen_region is not None:
+                x, y, w, h = screen_region
+                self._monitor = {"left": x, "top": y, "width": w, "height": h}
+            else:
+                self._monitor = primary
+            self.W = self._monitor["width"]
+            self.H = self._monitor["height"]
+            self.fps = 30.0  # nominal; mss is fast enough not to bottleneck
+            self._pending: np.ndarray | None = None
+            return
+
+        self._cap = cv2.VideoCapture(cv_source)
+        if not self._cap.isOpened():
+            raise click.ClickException(f"Could not open source: {cv_source}")
+        # Cuts capture-side lag when the producer is faster than inference.
+        # Silently ignored by backends that don't honor it.
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        ret, frame = self._cap.read()
+        if not ret:
+            self._cap.release()
+            raise click.ClickException("Failed to read first frame from source.")
+        self.H, self.W = frame.shape[:2]
+        self.fps = self._cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self.total = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
+        self._pending = frame
+
+    def read(self) -> np.ndarray | None:
+        if self.kind == "screen":
+            shot = self._sct.grab(self._monitor)
+            # mss returns BGRA; downstream code expects BGR
+            return cv2.cvtColor(np.array(shot), cv2.COLOR_BGRA2BGR)
+        if self._pending is not None:
+            f, self._pending = self._pending, None
+            return f
+        ret, frame = self._cap.read()
+        return frame if ret else None
+
+    def release(self) -> None:
+        if self.kind == "screen":
+            self._sct.close()
+        else:
+            self._cap.release()
+
+
 @click.command()
 @click.option(
     "--source",
     default="0",
     show_default=True,
-    help="Webcam index (0, 1, ...) or RTSP/HTTP URL.",
+    help="Webcam index (0, 1, ...), file path, or RTSP/HTTP URL. "
+         "Ignored when --screen is set.",
+)
+@click.option(
+    "--screen",
+    is_flag=True,
+    default=False,
+    help="Capture from the screen instead of --source. Useful for "
+         "demoing the live pipeline against any video playing on the "
+         "desktop (browser, VLC, capture-card app).",
+)
+@click.option(
+    "--screen-region",
+    default=None,
+    help="Limit screen capture to a region: 'X,Y,W,H' in screen pixels. "
+         "Default is the full primary monitor. Useful for tracking just "
+         "a video player window instead of the whole screen.",
 )
 @click.option(
     "--overlay",
@@ -106,6 +189,8 @@ from track_ball import _select_best_mask, build_predictor, DEFAULT_BALL_CLASS_ID
 )
 def main(
     source: str,
+    screen: bool,
+    screen_region: str | None,
     overlay: str,
     model_size: str,
     model_path: Path | None,
@@ -120,7 +205,6 @@ def main(
     window: bool,
 ) -> None:
     """Stream a live source through the ball-tracking pipeline."""
-    src: int | str = int(source) if source.isdigit() else source
     overlay_fn = OVERLAYS[overlay]
 
     if model_path:
@@ -132,24 +216,25 @@ def main(
         weights_path=str(model_path) if model_path else None,
     )
 
-    cap = cv2.VideoCapture(src)
-    if not cap.isOpened():
-        raise click.ClickException(f"Could not open source: {source}")
-
-    # Reduce capture buffer to minimize lag when the producer (webcam /
-    # capture card) is faster than our inference loop. Not all backends
-    # honor this — silently ignored if unsupported.
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-    ret, frame = cap.read()
-    if not ret:
-        cap.release()
-        raise click.ClickException("Failed to read first frame from source.")
-    H, W = frame.shape[:2]
-    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    # 0 / -1 for live sources (webcam, RTSP). tqdm shows just the count
-    # in that case, which is fine.
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
+    if screen:
+        region: tuple[int, int, int, int] | None = None
+        if screen_region:
+            try:
+                parts = [int(p) for p in screen_region.split(",")]
+                if len(parts) != 4:
+                    raise ValueError
+                region = (parts[0], parts[1], parts[2], parts[3])
+            except ValueError as exc:
+                raise click.ClickException(
+                    f"--screen-region must be 'X,Y,W,H', got {screen_region!r}"
+                ) from exc
+        fs = _FrameSource(cv_source=None, screen_region=region)
+        src_label = f"screen[{fs.W}x{fs.H}]"
+    else:
+        cv_source: int | str = int(source) if source.isdigit() else source
+        fs = _FrameSource(cv_source=cv_source)
+        src_label = str(cv_source)
+    H, W, src_fps, total_frames = fs.H, fs.W, fs.fps, fs.total
 
     writer = None
     if record_path:
@@ -167,7 +252,7 @@ def main(
     last_real_centroid: tuple[int, int] | None = None
 
     click.echo(
-        f"Live tracking — source={src} {W}x{H}@{src_fps:.1f}fps "
+        f"Live tracking — source={src_label} {W}x{H}@{src_fps:.1f}fps "
         f"overlay={overlay} conf>={conf} imgsz={imgsz}  "
         f"press 'q' or ESC in the window to quit"
     )
@@ -176,17 +261,14 @@ def main(
     n_frames = 0
     rolling_fps = 0.0
     t_last = t_start
-    first_iter = True
     pbar = tqdm(total=total_frames, desc="live", unit="f")
 
     try:
         while True:
-            if not first_iter:
-                ret, frame = cap.read()
-                if not ret:
-                    click.echo("Source ended.")
-                    break
-            first_iter = False
+            frame = fs.read()
+            if frame is None:
+                click.echo("Source ended.")
+                break
 
             results = predictor(
                 frame,
@@ -263,7 +345,7 @@ def main(
                 pbar.set_postfix(fps=f"{rolling_fps:.1f}")
     finally:
         pbar.close()
-        cap.release()
+        fs.release()
         if writer is not None:
             writer.release()
         if window:
