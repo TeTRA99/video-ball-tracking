@@ -427,15 +427,13 @@ def main(
                         jump_fade_remaining = JUMP_FADE_FRAMES
                 prev_draw_centroid = (cx, cy)
 
-                # Confidence floor at 0.4 so we don't dim too aggressively
-                # when extrapolating (picked_conf is 0 then).
-                conf_alpha = max(0.4, picked_conf) if is_real else 0.85
+                # Only the jump fade modulates alpha now. Stable detections
+                # draw at full opacity regardless of confidence.
                 if jump_fade_remaining > 0:
-                    fade_factor = 1.0 - (jump_fade_remaining / JUMP_FADE_FRAMES)
+                    alpha = 1.0 - (jump_fade_remaining / JUMP_FADE_FRAMES)
                     jump_fade_remaining -= 1
                 else:
-                    fade_factor = 1.0
-                alpha = conf_alpha * fade_factor
+                    alpha = 1.0
 
                 if alpha > 0.01:
                     drawn = overlay_fn(
