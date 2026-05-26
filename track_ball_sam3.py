@@ -171,7 +171,7 @@ def main(input_path: Path, output_path: Path, overlay: str, text: str) -> None:
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
-    click.echo(f"Loading SAM 3.1 (multiplex video predictor)…")
+    click.echo("Loading SAM 3 (standard video predictor)…")
     predictor = build_predictor()
     click.echo(f"Tracking prompt: {text!r}  overlay: {overlay}  frames: {n_frames}")
 
