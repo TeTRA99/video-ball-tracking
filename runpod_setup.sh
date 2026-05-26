@@ -48,7 +48,10 @@ if ! command -v uv &>/dev/null; then
 fi
 
 cd "$WORK/video-ball-tracking"
-uv venv --python 3.13
+# Python 3.12, not 3.13: torch 2.11+cu128 has a parse bug in
+# _jit_internal.py under cp313 (IndentationError reading its own RNN
+# overload decorator). 3.12 is what SAM 3's README pins anyway.
+uv venv --python 3.12
 # shellcheck source=/dev/null
 source .venv/bin/activate
 
