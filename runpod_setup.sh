@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# RunPod / cloud GPU setup for SAM 3.1 video ball tracking.
+# RunPod / cloud GPU setup for SAM 3 video ball tracking.
 #
-# Target pod: H100 PCIe or H100 SXM, PyTorch 2.x image (RunPod's official
-# "PyTorch 2.4.0 + CUDA 12.4" or newer works fine — we'll install the
-# right torch ourselves to be sure).
+# NOTE: this runs SAM 3 (Nov 2025), not SAM 3.1 (Mar 2026). The public
+# sam3.1_multiplex.pt checkpoint is broken on public-main code (Meta
+# trained it against an internal fork; no migration shipped). See
+# facebookresearch/sam3 issue #526, still open as of 2026-05-26. For
+# single-object tracking like ours, SAM 3 and SAM 3.1 are quality-
+# equivalent — multiplex is a multi-object throughput optimization.
+#
+# Recommended pod: A100 80GB Community Cloud (~$1/hr). Has plenty of
+# headroom for SAM 3 (~20 GB peak), half the H100 price. H100 PCIe
+# (~$2/hr) also works if A100 isn't available in your region.
 #
 # Run this once on a fresh pod after attaching to its web terminal:
 #     bash runpod_setup.sh
@@ -11,10 +18,12 @@
 # Then upload your clip into ~/work/clips/ (drag-drop in Jupyter, or scp)
 # and run:
 #     cd ~/work/video-ball-tracking
-#     python track_ball_sam3.py --input ../clips/game2.mp4 --output ../out/game2_sam3.mp4 --overlay ring --text "soccer ball"
+#     source .venv/bin/activate
+#     python track_ball_sam3.py --input ../clips/game2.mp4 \
+#         --output ../out/game2_sam3.mp4 --overlay ring --text "soccer ball"
 #
-# Cost estimate: ~30 min setup + ~10 min per 30-sec clip on H100 PCIe at
-# $1.99/hr ≈ $1.50 for setup + $0.30/clip. Budget $5-10 for full eval.
+# Cost estimate: ~30 min setup + ~10-15 min per 30-sec clip on A100 80GB
+# at $1/hr ≈ $0.50 setup + $0.20/clip. Budget $2-4 for full eval.
 set -euo pipefail
 
 WORK=$HOME/work
@@ -93,23 +102,32 @@ else:
 PYPATCH
 fi
 
-echo "==> FA3 dtype patch — H100 supports fp8 natively, so the FA3 fp8 hardcode"
-echo "    should work as-is. Only patch to bf16 if FA3 isn't supported."
-# (Intentionally skipping — leaving the upstream FP8 path on H100.)
+echo "==> FA3 dtype patch — required on A100 (Ampere); H100 (Hopper) is fine"
+echo "    as-is because it supports the upstream FP8 path. We detect and patch"
+echo "    only when needed."
+GPU_NAME=$(python -c "import torch; print(torch.cuda.get_device_name(0))")
+echo "    GPU: $GPU_NAME"
+if [[ "$GPU_NAME" != *H100* && "$GPU_NAME" != *H200* ]]; then
+    FA3_FILE="$WORK/sam3/sam3/perflib/fa3.py"
+    if [ -f "$FA3_FILE" ] && grep -q "float8_e4m3fn" "$FA3_FILE"; then
+        echo "    Patching $FA3_FILE: float8_e4m3fn -> bfloat16"
+        sed -i 's/torch\.float8_e4m3fn/torch.bfloat16/g' "$FA3_FILE"
+    fi
+fi
 
 echo "==> HuggingFace auth (you'll get prompted to paste a token with"
-echo "    'read' access to facebook/sam3.1 — request access on the model page first)"
+echo "    'read' access to facebook/sam3 — request access on the model page first)"
 hf auth login || huggingface-cli login
 
-echo "==> Download SAM 3.1 checkpoint (uses repo helper if present, else pulls"
-echo "    the default via the model builder on first run)"
+echo "==> Download SAM 3 checkpoint (standard non-multiplex video predictor;"
+echo "    works on public main code, unlike sam3.1_multiplex)"
 cd "$WORK/sam3"
 python - <<'PYDL'
 # Touch the model builder so the checkpoint gets cached locally now,
 # instead of mid-inference (matters because we want clean timings).
-from sam3.model_builder import build_sam3_multiplex_video_predictor
-print("Loading SAM 3.1 multiplex video predictor (downloads on first run)...")
-predictor = build_sam3_multiplex_video_predictor(max_num_objects=2)
+from sam3.model_builder import build_sam3_video_predictor
+print("Loading SAM 3 video predictor (downloads facebook/sam3 on first run)...")
+predictor = build_sam3_video_predictor()
 print("OK — predictor loaded.")
 del predictor
 import torch

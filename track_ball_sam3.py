@@ -28,23 +28,19 @@ from tqdm import tqdm
 from overlays import OVERLAYS
 
 
-def build_predictor(max_num_objects: int = 2):
-    """Construct the SAM 3.1 multi-object (Object Multiplex) video predictor.
+def build_predictor():
+    """Construct the standard SAM 3 video predictor.
 
-    max_num_objects sizes the multiplex bucket. The default in upstream is 16,
-    which preallocates VRAM for 16 objects whether they exist or not — too
-    heavy for 8 GB consumer GPUs when we only need 1 ball. Drop to 2 (one
-    real + headroom for false positives).
+    We use SAM 3 (Nov 2025) not SAM 3.1 (Mar 2026): the public sam3.1_multiplex.pt
+    checkpoint doesn't load on the public main branch — Meta trained it against
+    an internal fork with renamed modules and didn't ship a converter. See
+    facebookresearch/sam3 issue #526 (open as of 2026-05-26). The sibling
+    facebook/sam3 / sam3.pt loads cleanly. For single-object tracking (one
+    ball), there's no quality difference — multiplex is a multi-object
+    throughput optimization, not a quality one.
     """
-    from sam3.model_builder import build_sam3_multiplex_video_predictor
-    try:
-        return build_sam3_multiplex_video_predictor(max_num_objects=max_num_objects)
-    except TypeError:
-        # Older API didn't expose max_num_objects on the builder; fall back.
-        predictor = build_sam3_multiplex_video_predictor()
-        if hasattr(predictor, "model") and hasattr(predictor.model, "max_num_objects"):
-            predictor.model.max_num_objects = max_num_objects
-        return predictor
+    from sam3.model_builder import build_sam3_video_predictor
+    return build_sam3_video_predictor()
 
 
 def _to_numpy_mask(m, target_hw: tuple[int, int]) -> np.ndarray:
