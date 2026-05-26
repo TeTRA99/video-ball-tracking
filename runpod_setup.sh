@@ -52,20 +52,32 @@ uv venv --python 3.13
 # shellcheck source=/dev/null
 source .venv/bin/activate
 
-echo "==> Detect host CUDA version and pick the matching PyTorch wheel index"
-# RunPod templates ship anywhere from CUDA 12.1 to 13.x. Installing a torch
-# wheel built against a NEWER CUDA than the host driver supports yields the
-# "CUDA driver initialization failed" trap. Detect and match.
+echo "==> Pre-flight: SAM 3 needs CUDA 12.6+ on the host driver"
+# Hard requirement from the SAM 3 README. CUDA 12.4 hosts ALWAYS fail
+# downstream — bail out now instead of wasting credit on a broken setup.
 HOST_CUDA=$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version: [0-9]+\.[0-9]+' | head -1 | awk '{print $3}')
 echo "    Host CUDA: ${HOST_CUDA:-unknown}"
-case "$HOST_CUDA" in
-    12.1*|12.2*|12.3*|12.4*) WHEEL_IDX="cu124" ;;
-    12.5*|12.6*)             WHEEL_IDX="cu126" ;;
-    12.7*|12.8*|12.9*|13.*)  WHEEL_IDX="cu128" ;;
-    *)                       WHEEL_IDX="cu124" ;;  # safe default — old wheels
-esac
-echo "    Using PyTorch wheel index: $WHEEL_IDX"
-uv pip install --pre torch torchvision --index-url "https://download.pytorch.org/whl/$WHEEL_IDX"
+HOST_CUDA_MAJOR=$(echo "$HOST_CUDA" | cut -d. -f1)
+HOST_CUDA_MINOR=$(echo "$HOST_CUDA" | cut -d. -f2)
+if [ -z "$HOST_CUDA_MAJOR" ]; then
+    echo "ERROR: could not detect host CUDA version. Is nvidia-smi available?"
+    exit 1
+fi
+if [ "$HOST_CUDA_MAJOR" -lt 12 ] || \
+   { [ "$HOST_CUDA_MAJOR" -eq 12 ] && [ "$HOST_CUDA_MINOR" -lt 6 ]; }; then
+    echo ""
+    echo "ERROR: SAM 3 requires CUDA 12.6+ on the host. This pod has $HOST_CUDA."
+    echo "STOP this pod (you've spent ~\$0) and redeploy with a newer template:"
+    echo "  - runpod/pytorch:2.6.0-py3.11-cuda12.6.3-cudnn-devel-ubuntu24.04"
+    echo "  - or any 'PyTorch 2.7' / 'CUDA 12.8' template you see in the dropdown"
+    exit 1
+fi
+
+echo "==> Install PyTorch 2.7+ on cu128 (matches SAM 3's README requirement)"
+# SAM 3 README pins torch 2.7+ with cu128. Newer hosts (CUDA 12.8+) match
+# directly; CUDA 12.6/12.7 hosts run cu128 wheels under the forward-
+# compatibility window. Older than 12.6 was rejected by the pre-flight above.
+uv pip install --pre "torch>=2.7" torchvision --index-url https://download.pytorch.org/whl/cu128
 
 echo "==> Verify torch can actually talk to the GPU before doing more setup"
 if ! python -c "import torch; assert torch.cuda.is_available(); print('GPU:', torch.cuda.get_device_name(0))"; then
@@ -75,20 +87,29 @@ if ! python -c "import torch; assert torch.cuda.is_available(); print('GPU:', to
     ls /dev/nvidia* 2>&1
     python -c "import ctypes; cuda = ctypes.CDLL('libcuda.so.1'); print('cuInit:', cuda.cuInit(0))"
     echo ""
-    echo "This pod's CUDA driver isn't initializable. STOP the pod"
-    echo "and redeploy with a different template (newer PyTorch image)."
+    echo "This pod's CUDA driver isn't initializable. STOP and redeploy."
     exit 1
 fi
 
 echo "==> Our project deps (opencv, ultralytics, mss, click, tqdm, etc.)"
 uv pip install -e .
 
-echo "==> SAM 3.1 hard deps that the README marks 'optional' but the code requires"
+echo "==> SAM 3 deps (README marks some optional, but inference imports them)"
 uv pip install einops pycocotools psutil ninja
 
 echo "==> Install SAM 3 itself"
 cd "$WORK/sam3"
 uv pip install -e .
+
+echo "==> Faster-inference deps the SAM 3 README recommends"
+# flash-attn-3 (Hopper/Ada — works on L40S, H100. Skip silently if it fails;
+# sam3 falls back to PyTorch SDPA.) --no-deps because flash-attn pins old
+# torch versions that conflict with the cu128 install above.
+uv pip install --no-deps flash-attn-3 --index-url https://download.pytorch.org/whl/cu128 || \
+    echo "    flash-attn-3 not installed (sam3 will use PyTorch SDPA fallback)"
+# cc_torch for fused custom CUDA ops — also optional but cheap to try.
+uv pip install "git+https://github.com/ronghanghu/cc_torch.git" || \
+    echo "    cc_torch not installed (sam3 will use vanilla CUDA ops)"
 
 echo "==> Patch the start_session kwargs bug (PR #543, not always merged)"
 # Filters unknown kwargs (like offload_state_to_cpu) before passing to
