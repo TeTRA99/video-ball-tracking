@@ -244,8 +244,7 @@ def main(
         src_label = str(cv_source)
     H, W, src_fps, total_frames = fs.H, fs.W, fs.fps, fs.total
 
-    writer = None
-    if record_path:
+    def _open_writer(target_fps: float) -> cv2.VideoWriter:
         record_path.parent.mkdir(parents=True, exist_ok=True)
         # Codec selection: cv2.VideoWriter on Windows silently produces a
         # 0-byte file when the requested fourcc isn't available. Pick by
@@ -256,20 +255,31 @@ def main(
             codec_chain = [("MJPG", "MJPG"), ("XVID", "XVID")]
         else:
             codec_chain = [("avc1", "H.264"), ("mp4v", "MPEG-4"), ("MJPG", "MJPG")]
-        writer = None
         for fourcc_str, label in codec_chain:
             fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
-            candidate = cv2.VideoWriter(str(record_path), fourcc, src_fps, (W, H))
+            candidate = cv2.VideoWriter(str(record_path), fourcc, target_fps, (W, H))
             if candidate.isOpened():
-                writer = candidate
-                click.echo(f"Recording to: {record_path} ({label}/{fourcc_str})")
-                break
+                click.echo(
+                    f"Recording to: {record_path} ({label}/{fourcc_str}) "
+                    f"@ {target_fps:.1f}fps"
+                )
+                return candidate
             candidate.release()
-        if writer is None:
-            raise click.ClickException(
-                f"No working codec found for {record_path}. "
-                f"Try a .avi extension or install K-Lite Codec Pack."
-            )
+        raise click.ClickException(
+            f"No working codec found for {record_path}. "
+            f"Try a .avi extension or install K-Lite Codec Pack."
+        )
+
+    # For file/webcam/URL sources, src_fps is trustworthy (cv2 reports it).
+    # For screen capture it's a nominal 30 — actual capture rate depends
+    # on the inference loop and varies. We open the writer for non-screen
+    # sources immediately, but defer screen-source writer opening until
+    # we've measured the actual loop rate via a warmup, so playback
+    # speed matches reality.
+    writer: cv2.VideoWriter | None = None
+    warmup_frames = 20 if (record_path and fs.kind == "screen") else 0
+    if record_path and warmup_frames == 0:
+        writer = _open_writer(src_fps)
 
     tracker = BallTracker(
         max_jump_per_frame=max_jump_px,
@@ -360,6 +370,11 @@ def main(
 
             if writer is not None:
                 writer.write(frame)
+            elif record_path and n_frames + 1 == warmup_frames:
+                # Warmup complete — open the writer with measured rate.
+                # rolling_fps has converged on actual loop throughput.
+                measured = rolling_fps if rolling_fps > 0 else src_fps
+                writer = _open_writer(measured)
 
             if window:
                 cv2.imshow("ball tracker (q/ESC to quit)", frame)
