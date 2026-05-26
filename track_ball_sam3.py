@@ -58,15 +58,25 @@ def _to_numpy_mask(m, target_hw: tuple[int, int]) -> np.ndarray:
 
 
 def _merge_masks(outputs: dict, frame_hw: tuple[int, int]) -> np.ndarray | None:
-    """Union all per-instance binary masks into a single mask. None if empty."""
+    """Pick the single highest-confidence per-instance mask. None if empty.
+
+    Previously this unioned ALL detected instance masks, which produced a
+    blob spanning the bounding box of every false positive plus the real
+    ball — the overlay centroid landed in the empty space between them.
+    SAM 3 reports out_probs per instance; just pick the best one, same
+    pattern as YOLO's _select_best_mask.
+    """
     masks = outputs.get("out_binary_masks", [])
     if len(masks) == 0:
         return None
-    merged: np.ndarray | None = None
-    for m in masks:
-        bm = _to_numpy_mask(m, frame_hw)
-        merged = bm if merged is None else np.logical_or(merged, bm).astype(np.uint8)
-    return merged
+    probs = outputs.get("out_probs", [])
+    if len(probs) == len(masks) and len(probs) > 0:
+        # Handle torch tensors or python floats
+        probs_list = [float(p) if not hasattr(p, "item") else p.item() for p in probs]
+        best_idx = int(np.argmax(probs_list))
+    else:
+        best_idx = 0
+    return _to_numpy_mask(masks[best_idx], frame_hw)
 
 
 def iter_predictions(
