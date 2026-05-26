@@ -195,6 +195,15 @@ class _FrameSource:
     show_default=True,
     help="Show a preview window. Disable for headless recording.",
 )
+@click.option(
+    "--tracker",
+    "tracker_yaml",
+    type=click.Choice(["bytetrack.yaml", "botsort.yaml"]),
+    default="bytetrack.yaml",
+    show_default=True,
+    help="Ultralytics tracker. ByteTrack = Kalman motion, fast. BoT-SORT "
+         "adds ReID, slower, usually overkill for ball tracking.",
+)
 def main(
     source: str,
     screen: bool,
@@ -211,6 +220,7 @@ def main(
     trail_frames: int,
     record_path: Path | None,
     window: bool,
+    tracker_yaml: str,
 ) -> None:
     """Stream a live source through the ball-tracking pipeline."""
     overlay_fn = OVERLAYS[overlay]
@@ -293,10 +303,11 @@ def main(
     history: deque[tuple[int, int]] = deque(maxlen=trail_frames)
     last_real_mask: np.ndarray | None = None
     last_real_centroid: tuple[int, int] | None = None
+    sticky_id: int | None = None
 
     click.echo(
         f"Live tracking — source={src_label} {W}x{H}@{src_fps:.1f}fps "
-        f"overlay={overlay} conf>={conf} imgsz={imgsz}  "
+        f"overlay={overlay} conf>={conf} imgsz={imgsz} tracker={tracker_yaml}  "
         f"press 'q' or ESC in the window to quit"
     )
 
@@ -313,19 +324,25 @@ def main(
                 click.echo("Source ended.")
                 break
 
-            results = predictor(
+            # persist=True keeps ByteTrack state across single-frame calls.
+            results = predictor.track(
                 frame,
                 classes=[ball_class],
                 conf=conf,
                 imgsz=imgsz,
+                tracker=tracker_yaml,
+                persist=True,
                 verbose=False,
             )
             result = results[0]
-            mask = _select_best_mask(
+            mask, picked_id = _select_best_mask(
                 result, frame.shape[:2],
                 max_ball_px=max_ball_px,
                 prev_centroid=tracker.last_centroid,
+                sticky_id=sticky_id,
             )
+            if sticky_id is None and picked_id is not None:
+                sticky_id = picked_id
 
             if mask is not None and mask.any():
                 ys, xs = np.where(mask > 0)

@@ -66,69 +66,84 @@ def _select_best_mask(
     max_aspect: float = 1.5,
     prev_centroid: tuple[int, int] | None = None,
     proximity_px: int = 200,
-) -> np.ndarray | None:
-    """Pick the SINGLE highest-confidence detection that passes filters and
-    return a binary mask. Works with both segmentation models (uses the
-    real mask) and detection-only models (synthesizes a disk from the
-    bbox).
+    sticky_id: int | None = None,
+) -> tuple[np.ndarray | None, int | None]:
+    """Pick a single detection's mask and return (mask, picked_tracker_id).
 
-    Picking one (instead of unioning all) eliminates per-frame jumpiness
-    when YOLO finds multiple "balls" — typically the real ball plus a few
-    false positives on heads/shadows.
+    Selection priority:
+    1. If `sticky_id` is given AND a current candidate has that ByteTrack/
+       BoT-SORT id, use that detection. ByteTrack maintains identity across
+       frames via Kalman filtering, so once we've locked onto the ball's
+       id we keep tracking it even when a player's head briefly outscores
+       the ball in confidence.
+    2. If `prev_centroid` is given AND multiple candidates pass filters,
+       prefer candidates within `proximity_px` of the previous position.
+    3. Otherwise pick the highest-confidence candidate.
 
-    Filters:
-    - longest bbox edge in [4, max_ball_px]
-    - aspect ratio <= max_aspect (ball is roughly square)
+    Filters before any selection: longest bbox edge in [4, max_ball_px],
+    aspect ratio <= max_aspect (ball is roughly square).
 
-    If `prev_centroid` is given and multiple candidates pass the size and
-    aspect filters, we prefer the ones within `proximity_px` of the
-    previous ball position. This kills the common failure mode where a
-    false detection on a player's head has higher confidence than the
-    real ball — the head is rarely near where the ball just was.
-    Falls back to plain max-confidence when no candidates are nearby
-    (genuine ball motion bigger than `proximity_px` from frame to frame).
+    Returns (mask, picked_id) so callers can thread sticky_id forward.
+    picked_id is None if the detector wasn't run in tracking mode.
     """
     if result.boxes is None or len(result.boxes) == 0:
-        return None
+        return None, None
     H, W = frame_hw
 
     confs = result.boxes.conf.tolist() if result.boxes.conf is not None else [1.0] * len(result.boxes)
-    candidates: list[tuple[float, int, tuple[float, float, float, float]]] = []
+    # When predictor.track() is used, .id is a tensor of ByteTrack/BoT-SORT
+    # ids. In plain predict mode, .id is None — we degrade gracefully.
+    raw_ids = result.boxes.id
+    if raw_ids is not None:
+        ids_list = [int(i) for i in raw_ids.tolist()]
+    else:
+        ids_list = [None] * len(result.boxes)
+
+    candidates: list[tuple[float, int, tuple[float, float, float, float], int | None]] = []
     for i, box in enumerate(result.boxes.xywh):
         cx, cy, w, h = box.tolist()
         if not (4 <= max(w, h) <= max_ball_px):
             continue
         if min(w, h) > 0 and max(w, h) / min(w, h) > max_aspect:
             continue
-        candidates.append((confs[i], i, (cx, cy, w, h)))
+        candidates.append((confs[i], i, (cx, cy, w, h), ids_list[i]))
 
     if not candidates:
-        return None
+        return None, None
 
-    if prev_centroid is not None and len(candidates) > 1:
-        px, py = prev_centroid
-        nearby = [
-            c for c in candidates
-            if (c[2][0] - px) ** 2 + (c[2][1] - py) ** 2 <= proximity_px ** 2
-        ]
-        if nearby:
-            candidates = nearby
+    selected = None
+    # 1. Prefer the locked id, if it survives the current frame's filters.
+    if sticky_id is not None:
+        for c in candidates:
+            if c[3] == sticky_id:
+                selected = c
+                break
+    # 2. Trajectory proximity as a tiebreaker among multiple candidates.
+    if selected is None:
+        pool = candidates
+        if prev_centroid is not None and len(pool) > 1:
+            px, py = prev_centroid
+            nearby = [
+                c for c in pool
+                if (c[2][0] - px) ** 2 + (c[2][1] - py) ** 2 <= proximity_px ** 2
+            ]
+            if nearby:
+                pool = nearby
+        selected = max(pool)
 
-    _, best_i, (cx, cy, w, h) = max(candidates)
+    _, best_i, (cx, cy, w, h), picked_id = selected
 
-    # Use the real segmentation mask if available
     if result.masks is not None and best_i < len(result.masks.data):
         m = result.masks.data[best_i]
         bm = m.detach().cpu().numpy() if hasattr(m, "detach") else np.asarray(m)
         if bm.shape != (H, W):
             bm = cv2.resize(bm.astype(np.float32), (W, H), interpolation=cv2.INTER_NEAREST)
-        return (bm > 0.5).astype(np.uint8)
+        return (bm > 0.5).astype(np.uint8), picked_id
 
-    # Detection-only model: synthesize a small disk mask from the bbox
     mask = np.zeros((H, W), dtype=np.uint8)
     radius = max(2, int(max(w, h) / 2))
     cv2.circle(mask, (int(cx), int(cy)), radius, 1, -1)
-    return mask
+    return mask, picked_id
 
 
 def iter_predictions(
@@ -137,22 +152,30 @@ def iter_predictions(
     conf: float = 0.25,
     imgsz: int = 640,
     ball_class: int = DEFAULT_BALL_CLASS_ID,
+    tracker: str = "bytetrack.yaml",
 ) -> Iterator[tuple[np.ndarray, object]]:
-    """Yield (frame_bgr, raw_result) per frame. The caller is responsible
-    for picking the best mask from the raw result — this lets the main
-    loop pass tracker state (previous centroid) into the selection.
+    """Yield (frame_bgr, raw_result) per frame. The caller picks the best
+    mask from raw_result — this lets the main loop pass tracker state in.
+
+    Uses Ultralytics' model.track() which runs ByteTrack (default) or
+    BoT-SORT on top of YOLO and assigns a stable id to each detection
+    across frames (Kalman-filtered motion association). result.boxes.id
+    surfaces those ids; _select_best_mask uses them to lock the overlay
+    onto one tracked instance instead of jumping each frame to whatever
+    YOLO scored highest.
 
     ball_class is the model's class id for "ball": 32 for stock YOLO26
-    (COCO 'sports ball'), 0 for our fine-tuned model on
-    football-players-detection. Set via the --ball-class CLI flag.
+    (COCO 'sports ball'), 0 for our fine-tuned model. Set via --ball-class.
     """
-    results = predictor(
+    results = predictor.track(
         source=str(video_path),
         stream=True,
         classes=[ball_class],
         conf=conf,
         imgsz=imgsz,
+        tracker=tracker,
         verbose=False,
+        persist=False,  # new session per file source
     )
     cap = cv2.VideoCapture(str(video_path))
     try:
@@ -263,6 +286,17 @@ def iter_predictions(
     show_default=True,
     help="How many recent ball positions to remember for the 'trail' overlay.",
 )
+@click.option(
+    "--tracker",
+    "tracker_yaml",
+    type=click.Choice(["bytetrack.yaml", "botsort.yaml"]),
+    default="bytetrack.yaml",
+    show_default=True,
+    help="Ultralytics tracker config. ByteTrack uses Kalman-filtered motion "
+         "for association — better at keeping the ball's id locked when a "
+         "player's head briefly outscores it. BoT-SORT adds an appearance "
+         "ReID model on top; usually overkill for ball tracking and slower.",
+)
 def main(
     input_path: Path,
     output_path: Path,
@@ -276,6 +310,7 @@ def main(
     max_jump_px: int,
     max_extrapolate: int,
     trail_frames: int,
+    tracker_yaml: str,
 ) -> None:
     """Annotate a soccer video by overlaying a graphic on the ball."""
     overlay_fn = OVERLAYS[overlay]
@@ -310,11 +345,11 @@ def main(
         max_extrapolate_frames=max_extrapolate,
     )
     history: deque[tuple[int, int]] = deque(maxlen=trail_frames)
-    # Cache the most recent real mask so we can re-draw it (translated to
-    # the predicted position) during extrapolation frames. Avoids having
-    # to synthesize a disk when we already know the ball's shape.
     last_real_mask: np.ndarray | None = None
     last_real_centroid: tuple[int, int] | None = None
+    # ByteTrack id we've locked onto for the ball. Set on first valid
+    # detection, kept across frames so the overlay sticks to one instance.
+    sticky_id: int | None = None
 
     t0 = time.perf_counter()
     n_done = 0
@@ -325,19 +360,19 @@ def main(
             predictor, input_path,
             conf=conf, imgsz=imgsz,
             ball_class=ball_class,
+            tracker=tracker_yaml,
         ),
         total=n_frames,
         desc=overlay,
     )):
-        # Mask selection happens here (not inside iter_predictions) so we
-        # can pass the tracker's last known centroid in — that lets the
-        # selector prefer detections near where the ball just was instead
-        # of always picking max confidence.
-        mask = _select_best_mask(
+        mask, picked_id = _select_best_mask(
             raw_result, frame.shape[:2],
             max_ball_px=max_ball_px,
             prev_centroid=tracker.last_centroid,
+            sticky_id=sticky_id,
         )
+        if sticky_id is None and picked_id is not None:
+            sticky_id = picked_id
 
         if mask is not None and mask.any():
             ys, xs = np.where(mask > 0)
