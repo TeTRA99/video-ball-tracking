@@ -57,26 +57,46 @@ def _to_numpy_mask(m, target_hw: tuple[int, int]) -> np.ndarray:
     return (m > 0.5).astype(np.uint8)
 
 
-def _merge_masks(outputs: dict, frame_hw: tuple[int, int]) -> np.ndarray | None:
-    """Pick the single highest-confidence per-instance mask. None if empty.
+def _merge_masks(
+    outputs: dict,
+    frame_hw: tuple[int, int],
+    sticky_id: int | None = None,
+) -> tuple[np.ndarray | None, int | None]:
+    """Pick a single per-instance mask and return (mask, picked_obj_id).
 
-    Previously this unioned ALL detected instance masks, which produced a
-    blob spanning the bounding box of every false positive plus the real
-    ball — the overlay centroid landed in the empty space between them.
-    SAM 3 reports out_probs per instance; just pick the best one, same
-    pattern as YOLO's _select_best_mask.
+    Selection strategy (in order):
+    1. If `sticky_id` was passed and is still in the current frame's IDs,
+       keep tracking THAT object — SAM 3's tracker already maintains
+       temporal identity, so locking onto the first frame's choice gives
+       us stable single-ball tracking instead of jumping between IDs.
+    2. Otherwise pick the highest-confidence detection (out_probs).
+    3. If no probs, pick index 0.
+
+    Returns (mask, picked_id) so the caller can thread sticky_id forward.
+    Without stickiness, we saw the ring jump from the real ball to a
+    player whenever a player briefly matched the "soccer ball" embedding
+    with higher confidence than the actual ball.
     """
     masks = outputs.get("out_binary_masks", [])
     if len(masks) == 0:
-        return None
+        return None, None
+
+    obj_ids_raw = outputs.get("out_obj_ids", [])
+    obj_ids = [int(i) if hasattr(i, "item") else int(i) for i in obj_ids_raw]
+
+    if sticky_id is not None and sticky_id in obj_ids:
+        idx = obj_ids.index(sticky_id)
+        return _to_numpy_mask(masks[idx], frame_hw), sticky_id
+
     probs = outputs.get("out_probs", [])
     if len(probs) == len(masks) and len(probs) > 0:
-        # Handle torch tensors or python floats
         probs_list = [float(p) if not hasattr(p, "item") else p.item() for p in probs]
         best_idx = int(np.argmax(probs_list))
     else:
         best_idx = 0
-    return _to_numpy_mask(masks[best_idx], frame_hw)
+
+    picked_id = obj_ids[best_idx] if best_idx < len(obj_ids) else None
+    return _to_numpy_mask(masks[best_idx], frame_hw), picked_id
 
 
 def iter_predictions(
@@ -114,6 +134,7 @@ def iter_predictions(
         })
 
     cap = cv2.VideoCapture(str(video_path))
+    sticky_id: int | None = None
 
     try:
         with autocast:
@@ -125,7 +146,9 @@ def iter_predictions(
                 ret, frame_bgr = cap.read()
                 if not ret:
                     break
-                mask = _merge_masks(response["outputs"], frame_bgr.shape[:2])
+                mask, sticky_id = _merge_masks(
+                    response["outputs"], frame_bgr.shape[:2], sticky_id=sticky_id,
+                )
                 yield frame_bgr, mask
     finally:
         cap.release()
