@@ -23,7 +23,9 @@ Latency notes:
 """
 from __future__ import annotations
 
+import subprocess
 import time
+import wave
 from collections import deque
 from pathlib import Path
 
@@ -35,6 +37,101 @@ from tqdm import tqdm
 from overlays import OVERLAYS
 from tracker import BallTracker
 from track_ball import _select_best_mask, build_predictor, DEFAULT_BALL_CLASS_ID
+
+
+def _resolve_audio_device(spec: str | None) -> int | None:
+    """Map a CLI --audio-device value to a sounddevice input index.
+
+    - None: system default input (whatever Windows currently selects)
+    - integer string: use that exact device index
+    - other string: case-insensitive substring match against device names
+    """
+    if spec is None:
+        return None
+    import sounddevice as sd
+
+    if spec.isdigit():
+        return int(spec)
+    needle = spec.lower()
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_input_channels"] > 0 and needle in d["name"].lower():
+            return i
+    lines = ["Audio input devices visible to sounddevice:"]
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_input_channels"] > 0:
+            lines.append(
+                f"  [{i}] {d['name']} "
+                f"({d['max_input_channels']} ch @ {int(d['default_samplerate'])} Hz)"
+            )
+    raise click.ClickException(
+        f"No audio input device matched {spec!r}.\n" + "\n".join(lines)
+    )
+
+
+class _AudioCapture:
+    """Streams audio from a USB UVC capture card's UAC sibling to a WAV.
+
+    Float32 from sounddevice → int16 PCM in the WAV (the standard format
+    for muxing back into MP4 via AAC encoding).
+    """
+
+    def __init__(
+        self,
+        device: int | None,
+        samplerate: int,
+        channels: int,
+        wav_path: Path,
+    ):
+        import sounddevice as sd
+
+        self._wav = wave.open(str(wav_path), "wb")
+        self._wav.setnchannels(channels)
+        self._wav.setsampwidth(2)
+        self._wav.setframerate(samplerate)
+        self._stream = sd.InputStream(
+            device=device,
+            samplerate=samplerate,
+            channels=channels,
+            callback=self._callback,
+            blocksize=0,
+        )
+
+    def _callback(self, indata, frames, time_info, status):
+        if status:
+            # Underruns / overflows print a warning but don't stop the stream.
+            click.echo(f"audio stream status: {status}", err=True)
+        pcm = (indata * 32767.0).clip(-32768, 32767).astype(np.int16)
+        self._wav.writeframes(pcm.tobytes())
+
+    def start(self) -> None:
+        self._stream.start()
+
+    def stop(self) -> None:
+        self._stream.stop()
+        self._stream.close()
+        self._wav.close()
+
+
+def _mux_video_audio(video_path: Path, audio_path: Path, output_path: Path) -> tuple[bool, str]:
+    """Mux a video-only MP4 + a WAV into a single MP4 via ffmpeg.
+
+    -c:v copy avoids re-encoding the video (no quality loss, fast).
+    -c:a aac re-encodes the WAV to AAC, which is the standard MP4 codec.
+    -shortest trims to whichever stream is shorter — protects against the
+    audio capture starting marginally before/after the video writer.
+    Returns (success, ffmpeg stderr).
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(video_path),
+        "-i", str(audio_path),
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "192k",
+        "-shortest",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.returncode == 0, result.stderr
 
 
 class _FrameSource:
@@ -204,6 +301,23 @@ class _FrameSource:
     help="Built-in: 'bytetrack.yaml' or 'botsort.yaml'. Or a custom path "
          "like 'trackers/bytetrack_ball.yaml' (shipped, tuned for ball).",
 )
+@click.option(
+    "--audio-device",
+    "audio_device_spec",
+    type=str,
+    default=None,
+    help="Audio input for --record mux. None = system default. Integer = "
+         "exact sounddevice index. String = case-insensitive name match "
+         "(e.g. 'USB Audio', 'HDMI'). Pass --audio-device list to see "
+         "available devices and exit.",
+)
+@click.option(
+    "--no-audio",
+    "skip_audio",
+    is_flag=True,
+    default=False,
+    help="Skip audio capture even when --record is set (video-only MP4).",
+)
 def main(
     source: str,
     screen: bool,
@@ -221,8 +335,24 @@ def main(
     record_path: Path | None,
     window: bool,
     tracker_yaml: str,
+    audio_device_spec: str | None,
+    skip_audio: bool,
 ) -> None:
     """Stream a live source through the ball-tracking pipeline."""
+    # Diagnostic: --audio-device list prints devices and exits without
+    # spinning up any inference.
+    if audio_device_spec == "list":
+        import sounddevice as sd
+
+        click.echo("Audio input devices:")
+        for i, d in enumerate(sd.query_devices()):
+            if d["max_input_channels"] > 0:
+                click.echo(
+                    f"  [{i}] {d['name']} "
+                    f"({d['max_input_channels']} ch @ {int(d['default_samplerate'])} Hz)"
+                )
+        return
+
     overlay_fn = OVERLAYS[overlay]
 
     if model_path:
@@ -254,47 +384,75 @@ def main(
         src_label = str(cv_source)
     H, W, src_fps, total_frames = fs.H, fs.W, fs.fps, fs.total
 
+    # Audio capture path: enabled when --record is set and --no-audio isn't.
+    # Audio is captured to a temp WAV beside the requested record_path; after
+    # the recording loop ends we mux video+audio into record_path via ffmpeg.
+    capture_audio = record_path is not None and not skip_audio
+    video_write_path: Path | None = None
+    audio_write_path: Path | None = None
+    audio_capture: _AudioCapture | None = None
+    if record_path is not None:
+        if capture_audio:
+            video_write_path = record_path.with_suffix(record_path.suffix + ".video.mp4")
+            audio_write_path = record_path.with_suffix(record_path.suffix + ".audio.wav")
+        else:
+            video_write_path = record_path
+
     def _open_writer(target_fps: float) -> cv2.VideoWriter:
-        record_path.parent.mkdir(parents=True, exist_ok=True)
+        assert video_write_path is not None
+        video_write_path.parent.mkdir(parents=True, exist_ok=True)
         # Codec selection: cv2.VideoWriter on Windows silently produces a
         # 0-byte file when the requested fourcc isn't available. Pick by
         # extension and try a small chain; MJPG/.avi is the always-works
         # fallback (bigger files, but reliable).
-        ext = record_path.suffix.lower()
+        ext = video_write_path.suffix.lower()
         if ext == ".avi":
             codec_chain = [("MJPG", "MJPG"), ("XVID", "XVID")]
         else:
-            # Skip avc1/H.264 even though it'd produce smaller files —
-            # Windows cv2.VideoWriter returns isOpened()=True even when
-            # OpenH264 is missing and ffmpeg's encoder init silently
-            # fails, so we'd "succeed" into a non-writing writer.
-            # mp4v is Windows-native and works without extra libraries.
             codec_chain = [("mp4v", "MPEG-4"), ("MJPG", "MJPG")]
         for fourcc_str, label in codec_chain:
             fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
-            candidate = cv2.VideoWriter(str(record_path), fourcc, target_fps, (W, H))
+            candidate = cv2.VideoWriter(str(video_write_path), fourcc, target_fps, (W, H))
             if candidate.isOpened():
                 click.echo(
-                    f"Recording to: {record_path} ({label}/{fourcc_str}) "
-                    f"@ {target_fps:.1f}fps"
+                    f"Recording video to: {video_write_path} "
+                    f"({label}/{fourcc_str}) @ {target_fps:.1f}fps"
                 )
                 return candidate
             candidate.release()
         raise click.ClickException(
-            f"No working codec found for {record_path}. "
+            f"No working codec found for {video_write_path}. "
             f"Try a .avi extension or install K-Lite Codec Pack."
         )
 
-    # For file/webcam/URL sources, src_fps is trustworthy (cv2 reports it).
-    # For screen capture it's a nominal 30 — actual capture rate depends
-    # on the inference loop and varies. We open the writer for non-screen
-    # sources immediately, but defer screen-source writer opening until
-    # we've measured the actual loop rate via a warmup, so playback
-    # speed matches reality.
+    def _start_audio_if_needed() -> None:
+        """Open the audio capture stream once we're about to start writing
+        video frames. Done lazily because the writer for screen sources
+        opens only after the warmup completes — we want audio and video
+        to start at the same wall-clock moment."""
+        nonlocal audio_capture
+        if not capture_audio or audio_capture is not None:
+            return
+        assert audio_write_path is not None
+        try:
+            device = _resolve_audio_device(audio_device_spec)
+            audio_capture = _AudioCapture(
+                device=device,
+                samplerate=48000,
+                channels=2,
+                wav_path=audio_write_path,
+            )
+            audio_capture.start()
+            click.echo(f"Recording audio to: {audio_write_path}")
+        except Exception as exc:
+            click.echo(f"Audio capture failed ({exc}); continuing video-only.", err=True)
+            audio_capture = None
+
     writer: cv2.VideoWriter | None = None
     warmup_frames = 20 if (record_path and fs.kind == "screen") else 0
     if record_path and warmup_frames == 0:
         writer = _open_writer(src_fps)
+        _start_audio_if_needed()
 
     tracker = BallTracker(
         max_jump_per_frame=max_jump_px,
@@ -419,6 +577,7 @@ def main(
                 # rolling_fps has converged on actual loop throughput.
                 measured = rolling_fps if rolling_fps > 0 else src_fps
                 writer = _open_writer(measured)
+                _start_audio_if_needed()
 
             if window:
                 cv2.imshow("ball tracker (q/ESC to quit)", frame)
@@ -435,8 +594,40 @@ def main(
         fs.release()
         if writer is not None:
             writer.release()
+        if audio_capture is not None:
+            try:
+                audio_capture.stop()
+            except Exception as exc:
+                click.echo(f"audio_capture.stop() raised: {exc}", err=True)
         if window:
             cv2.destroyAllWindows()
+
+    # Mux audio + video into the requested record_path. Done after the
+    # try/finally so any stop errors above don't leave us holding open
+    # files when ffmpeg tries to read them.
+    if (
+        capture_audio
+        and audio_capture is not None
+        and record_path is not None
+        and video_write_path is not None
+        and audio_write_path is not None
+        and video_write_path.exists()
+        and audio_write_path.exists()
+        and audio_write_path.stat().st_size > 0
+    ):
+        click.echo(f"Muxing into {record_path}…")
+        ok, stderr = _mux_video_audio(video_write_path, audio_write_path, record_path)
+        if ok:
+            video_write_path.unlink(missing_ok=True)
+            audio_write_path.unlink(missing_ok=True)
+            click.echo(f"Wrote {record_path} (video + audio)")
+        else:
+            click.echo(
+                "ffmpeg mux failed — keeping the temp files so you can mux manually:\n"
+                f"  video: {video_write_path}\n  audio: {audio_write_path}\n"
+                f"ffmpeg stderr (last lines):\n{stderr[-2000:]}",
+                err=True,
+            )
 
     elapsed = time.perf_counter() - t_start
     avg_fps = n_frames / elapsed if elapsed > 0 else 0.0

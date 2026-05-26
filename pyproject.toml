@@ -12,6 +12,7 @@ dependencies = [
     "pillow>=10",
     "ultralytics>=8.3.237",  # YOLO26-seg
     "mss>=9.0",  # screen capture for track_live --screen
+    "sounddevice>=0.5",  # USB audio capture (for muxing into --record outputs)
 ]
 
 [tool.setuptools]
