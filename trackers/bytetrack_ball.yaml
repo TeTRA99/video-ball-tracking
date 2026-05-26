@@ -1,0 +1,22 @@
+# ByteTrack tuned for soccer ball tracking
+#
+# Ultralytics defaults are general-purpose. The ball is a small, fast,
+# low-confidence detection that briefly disappears behind players — the
+# defaults make it too easy for a higher-confidence head detection to
+# spawn a new track and steal the overlay's lock. These overrides:
+#
+# - Raise new_track_thresh so only very confident detections spawn a new
+#   track id. A head detection at conf 0.3 stays unmatched-and-discarded
+#   instead of stealing the ball's id.
+# - Lengthen track_buffer so the ball's existing track id survives long
+#   occlusions (2 seconds at 30 fps) instead of being dropped after a
+#   single second.
+# - Soften match_thresh because small fast objects produce low frame-to-
+#   frame IoU and the default rejects valid matches.
+tracker_type: bytetrack
+track_high_thresh: 0.20
+track_low_thresh: 0.05
+new_track_thresh: 0.45
+track_buffer: 60
+match_thresh: 0.75
+fuse_score: True

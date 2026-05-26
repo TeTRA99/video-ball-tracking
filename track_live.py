@@ -198,11 +198,11 @@ class _FrameSource:
 @click.option(
     "--tracker",
     "tracker_yaml",
-    type=click.Choice(["bytetrack.yaml", "botsort.yaml"]),
+    type=str,
     default="bytetrack.yaml",
     show_default=True,
-    help="Ultralytics tracker. ByteTrack = Kalman motion, fast. BoT-SORT "
-         "adds ReID, slower, usually overkill for ball tracking.",
+    help="Built-in: 'bytetrack.yaml' or 'botsort.yaml'. Or a custom path "
+         "like 'trackers/bytetrack_ball.yaml' (shipped, tuned for ball).",
 )
 def main(
     source: str,

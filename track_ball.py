@@ -289,13 +289,14 @@ def iter_predictions(
 @click.option(
     "--tracker",
     "tracker_yaml",
-    type=click.Choice(["bytetrack.yaml", "botsort.yaml"]),
+    type=str,
     default="bytetrack.yaml",
     show_default=True,
-    help="Ultralytics tracker config. ByteTrack uses Kalman-filtered motion "
-         "for association — better at keeping the ball's id locked when a "
-         "player's head briefly outscores it. BoT-SORT adds an appearance "
-         "ReID model on top; usually overkill for ball tracking and slower.",
+    help="Ultralytics tracker config. Built-in names: 'bytetrack.yaml' "
+         "(Kalman motion, default) or 'botsort.yaml' (motion + ReID, "
+         "heavier). Or pass a path to a custom yaml — we ship "
+         "'trackers/bytetrack_ball.yaml' tuned for small-fast-object "
+         "tracking with stickier ids during brief occlusions.",
 )
 def main(
     input_path: Path,
