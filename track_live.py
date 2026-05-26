@@ -306,7 +306,7 @@ def main(
     sticky_id: int | None = None
     prev_draw_centroid: tuple[int, int] | None = None
     jump_fade_remaining = 0
-    JUMP_FADE_FRAMES = 10
+    JUMP_FADE_FRAMES = 15
     JUMP_THRESHOLD_PX = 150
 
     click.echo(

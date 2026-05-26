@@ -357,11 +357,10 @@ def main(
     #     compare against it to detect jumps.
     prev_draw_centroid: tuple[int, int] | None = None
     jump_fade_remaining = 0
-    # 10 frames ~= 333ms at 30fps. Linear ramp: invisible at the jump frame,
-    # fully visible at frame +10. Longer than the original 3 to make the
-    # post-jump "pause" obvious enough that the viewer's eye registers it
-    # as a position change rather than missing the teleport.
-    JUMP_FADE_FRAMES = 10
+    # 15 frames ~= 500ms at 30fps. Linear ramp: invisible at the jump frame,
+    # fully visible at frame +15. Long enough that the viewer's eye reads
+    # the gap as "the overlay is reorienting" rather than a teleport.
+    JUMP_FADE_FRAMES = 15
     JUMP_THRESHOLD_PX = 150
 
     t0 = time.perf_counter()
