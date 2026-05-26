@@ -52,11 +52,33 @@ uv venv --python 3.13
 # shellcheck source=/dev/null
 source .venv/bin/activate
 
-echo "==> PyTorch with the matching CUDA wheel index"
-# H100 is Hopper. Most RunPod images ship CUDA 12.4-12.8; PyTorch's cu128
-# index covers Hopper. Re-check https://pytorch.org/get-started/locally/
-# at run time if this index URL has rotated.
-uv pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/cu128
+echo "==> Detect host CUDA version and pick the matching PyTorch wheel index"
+# RunPod templates ship anywhere from CUDA 12.1 to 13.x. Installing a torch
+# wheel built against a NEWER CUDA than the host driver supports yields the
+# "CUDA driver initialization failed" trap. Detect and match.
+HOST_CUDA=$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version: [0-9]+\.[0-9]+' | head -1 | awk '{print $3}')
+echo "    Host CUDA: ${HOST_CUDA:-unknown}"
+case "$HOST_CUDA" in
+    12.1*|12.2*|12.3*|12.4*) WHEEL_IDX="cu124" ;;
+    12.5*|12.6*)             WHEEL_IDX="cu126" ;;
+    12.7*|12.8*|12.9*|13.*)  WHEEL_IDX="cu128" ;;
+    *)                       WHEEL_IDX="cu124" ;;  # safe default — old wheels
+esac
+echo "    Using PyTorch wheel index: $WHEEL_IDX"
+uv pip install --pre torch torchvision --index-url "https://download.pytorch.org/whl/$WHEEL_IDX"
+
+echo "==> Verify torch can actually talk to the GPU before doing more setup"
+if ! python -c "import torch; assert torch.cuda.is_available(); print('GPU:', torch.cuda.get_device_name(0))"; then
+    echo "ERROR: torch.cuda.is_available() returned False."
+    echo "Diagnostics:"
+    nvidia-smi | head -3 || echo "  nvidia-smi failed"
+    ls /dev/nvidia* 2>&1
+    python -c "import ctypes; cuda = ctypes.CDLL('libcuda.so.1'); print('cuInit:', cuda.cuInit(0))"
+    echo ""
+    echo "This pod's CUDA driver isn't initializable. STOP the pod"
+    echo "and redeploy with a different template (newer PyTorch image)."
+    exit 1
+fi
 
 echo "==> Our project deps (opencv, ultralytics, mss, click, tqdm, etc.)"
 uv pip install -e .
