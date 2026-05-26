@@ -304,6 +304,10 @@ def main(
     last_real_mask: np.ndarray | None = None
     last_real_centroid: tuple[int, int] | None = None
     sticky_id: int | None = None
+    prev_draw_centroid: tuple[int, int] | None = None
+    jump_fade_remaining = 0
+    JUMP_FADE_FRAMES = 3
+    JUMP_THRESHOLD_PX = 150
 
     click.echo(
         f"Live tracking — source={src_label} {W}x{H}@{src_fps:.1f}fps "
@@ -335,7 +339,7 @@ def main(
                 verbose=False,
             )
             result = results[0]
-            mask, picked_id = _select_best_mask(
+            mask, picked_id, picked_conf = _select_best_mask(
                 result, frame.shape[:2],
                 max_ball_px=max_ball_px,
                 prev_centroid=tracker.last_centroid,
@@ -373,9 +377,29 @@ def main(
                         draw_mask = None
 
                 if draw_mask is not None:
-                    frame = overlay_fn(
-                        frame, draw_mask, frame_idx=n_frames, history=history,
-                    )
+                    if prev_draw_centroid is not None:
+                        dx = cx - prev_draw_centroid[0]
+                        dy = cy - prev_draw_centroid[1]
+                        if dx * dx + dy * dy > JUMP_THRESHOLD_PX * JUMP_THRESHOLD_PX:
+                            jump_fade_remaining = JUMP_FADE_FRAMES
+                    prev_draw_centroid = (cx, cy)
+
+                    conf_alpha = max(0.4, picked_conf) if is_real else 0.85
+                    if jump_fade_remaining > 0:
+                        fade_factor = 1.0 - (jump_fade_remaining / JUMP_FADE_FRAMES)
+                        jump_fade_remaining -= 1
+                    else:
+                        fade_factor = 1.0
+                    alpha = conf_alpha * fade_factor
+
+                    if alpha > 0.01:
+                        drawn = overlay_fn(
+                            frame, draw_mask, frame_idx=n_frames, history=history,
+                        )
+                        if alpha >= 0.999:
+                            frame = drawn
+                        else:
+                            frame = cv2.addWeighted(frame, 1 - alpha, drawn, alpha, 0)
 
             # Rolling FPS in the HUD so you can see live perf
             t_now = time.perf_counter()

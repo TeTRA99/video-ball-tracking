@@ -67,7 +67,7 @@ def _select_best_mask(
     prev_centroid: tuple[int, int] | None = None,
     proximity_px: int = 200,
     sticky_id: int | None = None,
-) -> tuple[np.ndarray | None, int | None]:
+) -> tuple[np.ndarray | None, int | None, float]:
     """Pick a single detection's mask and return (mask, picked_tracker_id).
 
     Selection priority:
@@ -87,7 +87,7 @@ def _select_best_mask(
     picked_id is None if the detector wasn't run in tracking mode.
     """
     if result.boxes is None or len(result.boxes) == 0:
-        return None, None
+        return None, None, 0.0
     H, W = frame_hw
 
     confs = result.boxes.conf.tolist() if result.boxes.conf is not None else [1.0] * len(result.boxes)
@@ -109,7 +109,7 @@ def _select_best_mask(
         candidates.append((confs[i], i, (cx, cy, w, h), ids_list[i]))
 
     if not candidates:
-        return None, None
+        return None, None, 0.0
 
     selected = None
     # 1. Prefer the locked id, if it survives the current frame's filters.
@@ -131,19 +131,19 @@ def _select_best_mask(
                 pool = nearby
         selected = max(pool)
 
-    _, best_i, (cx, cy, w, h), picked_id = selected
+    picked_conf, best_i, (cx, cy, w, h), picked_id = selected
 
     if result.masks is not None and best_i < len(result.masks.data):
         m = result.masks.data[best_i]
         bm = m.detach().cpu().numpy() if hasattr(m, "detach") else np.asarray(m)
         if bm.shape != (H, W):
             bm = cv2.resize(bm.astype(np.float32), (W, H), interpolation=cv2.INTER_NEAREST)
-        return (bm > 0.5).astype(np.uint8), picked_id
+        return (bm > 0.5).astype(np.uint8), picked_id, float(picked_conf)
 
     mask = np.zeros((H, W), dtype=np.uint8)
     radius = max(2, int(max(w, h) / 2))
     cv2.circle(mask, (int(cx), int(cy)), radius, 1, -1)
-    return mask, picked_id
+    return mask, picked_id, float(picked_conf)
 
 
 def iter_predictions(
@@ -348,9 +348,17 @@ def main(
     history: deque[tuple[int, int]] = deque(maxlen=trail_frames)
     last_real_mask: np.ndarray | None = None
     last_real_centroid: tuple[int, int] | None = None
-    # ByteTrack id we've locked onto for the ball. Set on first valid
-    # detection, kept across frames so the overlay sticks to one instance.
     sticky_id: int | None = None
+    # Hybrid overlay-alpha state:
+    #   - jump_fade_remaining is decremented each frame after a teleport-
+    #     sized jump; while > 0 we suppress the overlay so the viewer
+    #     never sees the hard position change.
+    #   - prev_draw_centroid is the last centroid we actually drew; we
+    #     compare against it to detect jumps.
+    prev_draw_centroid: tuple[int, int] | None = None
+    jump_fade_remaining = 0
+    JUMP_FADE_FRAMES = 3
+    JUMP_THRESHOLD_PX = 150
 
     t0 = time.perf_counter()
     n_done = 0
@@ -366,7 +374,7 @@ def main(
         total=n_frames,
         desc=overlay,
     )):
-        mask, picked_id = _select_best_mask(
+        mask, picked_id, picked_conf = _select_best_mask(
             raw_result, frame.shape[:2],
             max_ball_px=max_ball_px,
             prev_centroid=tracker.last_centroid,
@@ -392,8 +400,6 @@ def main(
                 last_real_centroid = (cx, cy)
                 n_hits += 1
             else:
-                # Extrapolated frame: shift the last real mask to the
-                # predicted centroid so all overlay shapes work unchanged.
                 if last_real_mask is not None and last_real_centroid is not None:
                     dx = cx - last_real_centroid[0]
                     dy = cy - last_real_centroid[1]
@@ -407,7 +413,34 @@ def main(
                 n_predicted += 1
 
             if draw_mask is not None:
-                frame = overlay_fn(frame, draw_mask, frame_idx=frame_idx, history=history)
+                # Jump detection: if the new draw centroid is implausibly
+                # far from the previous one, trigger a brief fade so the
+                # viewer sees a quick blink, not a hard teleport.
+                if prev_draw_centroid is not None:
+                    dx = cx - prev_draw_centroid[0]
+                    dy = cy - prev_draw_centroid[1]
+                    if dx * dx + dy * dy > JUMP_THRESHOLD_PX * JUMP_THRESHOLD_PX:
+                        jump_fade_remaining = JUMP_FADE_FRAMES
+                prev_draw_centroid = (cx, cy)
+
+                # Confidence floor at 0.4 so we don't dim too aggressively
+                # when extrapolating (picked_conf is 0 then).
+                conf_alpha = max(0.4, picked_conf) if is_real else 0.85
+                if jump_fade_remaining > 0:
+                    fade_factor = 1.0 - (jump_fade_remaining / JUMP_FADE_FRAMES)
+                    jump_fade_remaining -= 1
+                else:
+                    fade_factor = 1.0
+                alpha = conf_alpha * fade_factor
+
+                if alpha > 0.01:
+                    drawn = overlay_fn(
+                        frame, draw_mask, frame_idx=frame_idx, history=history,
+                    )
+                    if alpha >= 0.999:
+                        frame = drawn
+                    else:
+                        frame = cv2.addWeighted(frame, 1 - alpha, drawn, alpha, 0)
 
         writer.write(frame)
         n_done += 1
