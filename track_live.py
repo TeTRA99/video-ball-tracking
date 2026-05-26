@@ -65,10 +65,15 @@ class _FrameSource:
                 self._monitor = {"left": x, "top": y, "width": w, "height": h}
             else:
                 self._monitor = primary
-            self.W = self._monitor["width"]
-            self.H = self._monitor["height"]
             self.fps = 30.0  # nominal; mss is fast enough not to bottleneck
-            self._pending: np.ndarray | None = None
+            # Do a trial grab so H/W reflect the ACTUAL captured pixel
+            # dimensions, not the monitor metadata. On Windows with DPI
+            # scaling != 100%, mss.grab returns physical pixels even
+            # though monitors[].width reports logical. Mismatch makes
+            # cv2.VideoWriter silently drop every frame.
+            shot = self._sct.grab(self._monitor)
+            self._pending = cv2.cvtColor(np.array(shot), cv2.COLOR_BGRA2BGR)
+            self.H, self.W = self._pending.shape[:2]
             return
 
         self._cap = cv2.VideoCapture(cv_source)
@@ -87,13 +92,16 @@ class _FrameSource:
         self._pending = frame
 
     def read(self) -> np.ndarray | None:
-        if self.kind == "screen":
-            shot = self._sct.grab(self._monitor)
-            # mss returns BGRA; downstream code expects BGR
-            return cv2.cvtColor(np.array(shot), cv2.COLOR_BGRA2BGR)
+        # Both modes prime _pending with the first frame in __init__
+        # (cv to learn HxW + FPS, screen to learn actual pixel dims under
+        # DPI scaling). Hand that back on the first call, then take the
+        # appropriate fresh-frame path.
         if self._pending is not None:
             f, self._pending = self._pending, None
             return f
+        if self.kind == "screen":
+            shot = self._sct.grab(self._monitor)
+            return cv2.cvtColor(np.array(shot), cv2.COLOR_BGRA2BGR)
         ret, frame = self._cap.read()
         return frame if ret else None
 
